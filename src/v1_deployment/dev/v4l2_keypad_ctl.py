@@ -13,8 +13,8 @@ from pynput.keyboard import Key
 pan_value = 0
 tilt_value = 0
 zoom_value = 0
-pan_increment = 2500
-tilt_increment = 2500
+pan_increment = 5000
+tilt_increment = 5000
 zoom_increment = 100
 
 def on_key_release(key):
