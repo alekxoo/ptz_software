@@ -32,7 +32,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 load_dotenv()
 
-
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 def load_yaml(file_path):
@@ -155,18 +154,18 @@ class VehicleTrackerApp:
 
         
         # Load configuration and models
-        # yaml_data = load_yaml("./config/config_b490dad8.yaml")
-        # self.class_labels, num_classes = parse_class_data(yaml_data)
+        yaml_data = load_yaml("../config/config_20a8ffdc.yaml")
+        self.class_labels, num_classes = parse_class_data(yaml_data)
 
-        # print("Loading classification model...")
-        # self.classification_model = models.resnet18(weights='IMAGENET1K_V1')
-        # self.classification_model.fc = nn.Linear(self.classification_model.fc.in_features, num_classes)
-        # self.classification_model.load_state_dict(torch.load("./config/best.pt"))
-        # self.classification_model.to(self.device)
-        # self.classification_model.eval()
+        print("Loading classification model...")
+        self.classification_model = models.resnet18(weights='IMAGENET1K_V1')
+        self.classification_model.fc = nn.Linear(self.classification_model.fc.in_features, num_classes)
+        self.classification_model.load_state_dict(torch.load("../config/best.pt"))
+        self.classification_model.to(self.device)
+        self.classification_model.eval()
 
-        self.class_labels = []
-        self.classification_model = None
+        # self.class_labels = []
+        # self.classification_model = None
         
         # Image transformation
         self.transform = transforms.Compose([
@@ -253,13 +252,14 @@ class VehicleTrackerApp:
         # Dynamic content area for additional features
         self.mode_content_frame = ctk.CTkFrame(self.right_panel)
         self.mode_content_frame.pack(fill="both", expand=True, padx=10, pady=10)
-
         
-        self.update_controls()
+        # self.update_controls()
+
 
     def switch_mode(self, mode):
-        self.current_mode.set(mode)
-        self.update_controls()
+        print("switch mode commented out")
+        # self.current_mode.set(mode)
+        # self.update_controls()
 
     def update_controls(self):
         # Clear current controls
@@ -430,7 +430,9 @@ class VehicleTrackerApp:
     #function to compute max logit of classification and entropy loss
     def classify_vehicle(self, roi_tensor, logit_threshold=2, entropy_threshold=0.5):
         """Runs CNN classification and applies both logit thresholding and entropy filtering."""
+
         with torch.no_grad():
+            #NOTE: this is where it breaks
             output = self.classification_model(roi_tensor)
             probabilities = F.softmax(output, dim=1)
 
@@ -476,64 +478,73 @@ class VehicleTrackerApp:
                     conf = box.conf[0].item()
                     if conf > 0.3:
                         # Compute center coordinates.
-                        # x_center, y_center = (x1 + x2) / (2) , (y1 + y2) / (2)
-                        
+                        print("Computing center coordinates")
+                        print(f"x1: {x1} x2: {x2}\n")
+                        print(f"y1: {y1} y2: {y2}\n")
+
+                        x_center, y_center = (x1 + x2) / (2) , (y1 + y2) / (2)
+                        print(f"x center: {x_center}\n")
+                        print(f"y center: {y_center}\n")
+
                         # Extract ROI for classification
                         roi = img_rgb[y1:y2, x1:x2]
+                        print(f"roi: {roi}")
+
                         if roi.size > 0:
-                            # roi_pil = Image.fromarray(roi)
-                            # roi_tensor = self.transform(roi_pil).unsqueeze(0).to(self.device)
+                            roi_pil = Image.fromarray(roi)
+                            roi_tensor = self.transform(roi_pil).unsqueeze(0).to(self.device)
 
 
                             # # Get classification result synchronously
-                            # classification_result = self.classify_vehicle(roi_tensor)
-                            # vehicle_class_name = classification_result.split(" (")[0]  # Extract just the class name
+                            print("calling classification function")
+                            classification_result = self.classify_vehicle(roi_tensor)
+                            print("post classification")
+                            vehicle_class_name = classification_result.split(" (")[0]  # Extract just the class name
+                            print("start classification on a seperate thread")
+                            # Run classification in a separate thread
+                            thread = Thread(target=lambda: vehicle_positions.append(
+                                f"Vehicle {idx+1}: {classification_result} ({x_center}, {y_center})"
+                            ))
+                            threads.append(thread)
+                            thread.start()
 
-                            # print("start classification on a seperate thread")
-                            # # Run classification in a separate thread
-                            # thread = Thread(target=lambda: vehicle_positions.append(
-                            #     f"Vehicle {idx+1}: {classification_result} ({x_center}, {y_center})"
-                            # ))
-                            # threads.append(thread)
-                            # thread.start()
-
-                            # print("drawing boudning box based on detection")
-                            # # Draw bounding box
+                            print("drawing boudning box based on detection")
+                            # Draw bounding box
                             # if self.tracking_enabled and vehicle_class_name == self.selected_label.get(): 
                             #     bbox_color = (0, 255, 0)  # Green for tracked vehicle
                             #     vehicle_found = True
                             #     self.vehicle_position.set(f"({x_center}, {y_center})")
                             #     tracking_vehicle_x = x_center
                             #     tracking_vehicle_y = y_center
-                            bbox_color = (255, 255, 255)  # Default white
 
+                            bbox_color = (255, 255, 255)  # Default white
                             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), bbox_color, 2)
 
-            # # Wait for all classification threads to finish
-            # for thread in threads:
-            #     thread.join()
+            # Wait for all classification threads to finish
+            for thread in threads:
+                thread.join()
 
-            # # Display vehicle positions
-            # print("display annotated")
-            # y_offset = annotated_frame.shape[0] - 40
-            # for position in vehicle_positions:
-            #     cv2.putText(annotated_frame, position, (10, y_offset),
-            #                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            #     y_offset -= 30
+            # Display vehicle positions
+            print("display annotated")
+            y_offset = annotated_frame.shape[0] - 40
+            for position in vehicle_positions:
+                cv2.putText(annotated_frame, position, (10, y_offset),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                y_offset -= 30
 
-            # # Handle tracking status
-            # is_tracking_lost = self.tracking_enabled and not vehicle_found
-            # self.track_status.set("Tracking" if self.tracking_enabled and vehicle_found else
-            #                     "Lost" if is_tracking_lost else "Not Tracking")
-            # if is_tracking_lost:
-            #     self.vehicle_position.set("N/A")
+            # Handle tracking status
+            is_tracking_lost = self.tracking_enabled and not vehicle_found
+            self.track_status.set("Tracking" if self.tracking_enabled and vehicle_found else
+                                "Lost" if is_tracking_lost else "Not Tracking")
+            if is_tracking_lost:
+                self.vehicle_position.set("N/A")
             
-            # # if self.tracking_enabled:
-            # #     # PID(tracking_vehicle_x, tracking_vehicle_y, (1.0 / 60.0), vehicle_found)
-            # #     new_time = time.time()
-            # #     print(new_time - old_time)
-            # # else:
-            # #     PID(0.0, 0.0, 0.0, False) #make sure reset timer is running always
+            # if self.tracking_enabled:
+            #     # PID(tracking_vehicle_x, tracking_vehicle_y, (1.0 / 60.0), vehicle_found)
+            #     new_time = time.time()
+            #     print(new_time - old_time)
+            # else:
+            #     PID(0.0, 0.0, 0.0, False) #make sure reset timer is running always
 
             # # Convert frame for Tkinter display
             frame_pil = Image.fromarray(cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB))
