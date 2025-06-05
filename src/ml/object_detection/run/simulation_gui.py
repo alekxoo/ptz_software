@@ -10,7 +10,6 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from ultralytics import YOLO
-import yaml
 import warnings
 import tkinter as tk
 from tkinter import ttk, Label, messagebox
@@ -35,6 +34,7 @@ load_dotenv()
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 def load_yaml(file_path):
+    import yaml
     with open(file_path, 'r') as file:
         data = yaml.safe_load(file)
     return data
@@ -93,6 +93,8 @@ class VehicleTrackerApp:
 
         try:
             # Load YAML
+            # DEBUG:
+            # yaml_path = "/home/alekxoo/Documents/mach/ptz_software/src/ml/object_detection/config/config_20a8ffdc.yaml"
             if yaml_path and os.path.isfile(yaml_path):
                 yaml_data = load_yaml(yaml_path)
                 self.class_labels, num_classes = parse_class_data(yaml_data)
@@ -157,15 +159,16 @@ class VehicleTrackerApp:
         yaml_data = load_yaml("../config/config_20a8ffdc.yaml")
         self.class_labels, num_classes = parse_class_data(yaml_data)
 
-        print("Loading classification model...")
+        model_classification_start_time = time.time()
+        print("Loading classification model...\n")
         self.classification_model = models.resnet18(weights='IMAGENET1K_V1')
+        print(f"Classification model loaded in {time.time() - model_classification_start_time:.2f} seconds\n")
         self.classification_model.fc = nn.Linear(self.classification_model.fc.in_features, num_classes)
         self.classification_model.load_state_dict(torch.load("../config/best.pt"))
+        print(f"Finished loading classification omdel in {time.time() - model_classification_start_time:.2f} seconds\n")
         self.classification_model.to(self.device)
         self.classification_model.eval()
-
-        # self.class_labels = []
-        # self.classification_model = None
+        print(f"Finished loading all models in {time.time() - model_classification_start_time:.2f} seconds\n")
         
         # Image transformation
         self.transform = transforms.Compose([
