@@ -567,46 +567,46 @@ class VehicleTrackerApp:
         cv2.destroyAllWindows()
 
         # --- Delete .yaml and .pt files in ./config/ ---
-        try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            config_dir = os.path.join(script_dir, "..", "config")
-            config_dir = os.path.normpath(config_dir)
+        # try:
+        #     script_dir = os.path.dirname(os.path.abspath(__file__))
+        #     config_dir = os.path.join(script_dir, "..", "config")
+        #     config_dir = os.path.normpath(config_dir)
 
-            if os.path.exists(config_dir) and os.path.isdir(config_dir):
-                yaml_files = glob.glob(os.path.join(config_dir, "*.yaml"))
-                pt_files = glob.glob(os.path.join(config_dir, "*.pt"))
+        #     if os.path.exists(config_dir) and os.path.isdir(config_dir):
+        #         yaml_files = glob.glob(os.path.join(config_dir, "*.yaml"))
+        #         pt_files = glob.glob(os.path.join(config_dir, "*.pt"))
 
-                if not yaml_files and not pt_files:
-                    print("No .yaml or .pt files found in config directory.")
-                else:
-                    for file_path in yaml_files + pt_files:
-                        try:
-                            os.remove(file_path)
-                            print(f"Deleted config file: {file_path}")
-                        except Exception as file_err:
-                            print(f"Failed to delete {file_path}: {file_err}")
-            else:
-                print("Config directory does not exist.")
+        #         if not yaml_files and not pt_files:
+        #             print("No .yaml or .pt files found in config directory.")
+        #         else:
+        #             for file_path in yaml_files + pt_files:
+        #                 try:
+        #                     os.remove(file_path)
+        #                     print(f"Deleted config file: {file_path}")
+        #                 except Exception as file_err:
+        #                     print(f"Failed to delete {file_path}: {file_err}")
+        #     else:
+        #         print("Config directory does not exist.")
 
-        except Exception as e:
-            print(f"Error deleting config files: {e}")
-            messagebox.showerror("Error", f"Error deleting config files: {e}")
+        # except Exception as e:
+        #     print(f"Error deleting config files: {e}")
+        #     messagebox.showerror("Error", f"Error deleting config files: {e}")
 
-        # --- Delete video if it exists ---
-        try:
-            video_path = os.path.join(script_dir, "..", "VideoOutputs", "output.mov")
-            video_path = os.path.normpath(video_path)
+        # # --- Delete video if it exists ---
+        # try:
+        #     video_path = os.path.join(script_dir, "..", "VideoOutputs", "output.mov")
+        #     video_path = os.path.normpath(video_path)
 
-            print(f"Checking for video file at: {video_path}")
+        #     print(f"Checking for video file at: {video_path}")
 
-            if os.path.exists(video_path):
-                os.remove(video_path)
-                print(f"Deleted video: {video_path}")
-            else:
-                print("No video file found.")
-        except Exception as e:
-            print(f"Error deleting video: {e}")
-            messagebox.showerror("Error", f"Error deleting video: {e}")
+        #     if os.path.exists(video_path):
+        #         os.remove(video_path)
+        #         print(f"Deleted video: {video_path}")
+        #     else:
+        #         print("No video file found.")
+        # except Exception as e:
+        #     print(f"Error deleting video: {e}")
+        #     messagebox.showerror("Error", f"Error deleting video: {e}")
 
         # --- Close the app window ---
         self.root.destroy()
