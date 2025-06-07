@@ -18,7 +18,6 @@ import yaml
 import warnings
 import tkinter as tk
 from tkinter import ttk, Label, messagebox
-import threading
 from threading import Thread
 import time
 import customtkinter as ctk

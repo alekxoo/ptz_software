@@ -85,6 +85,7 @@ def gstreamer_pipeline(
         )
     
 class VehicleTrackerApp:
+
     def on_model_download_success(self, username, racename, yaml_path=None, model_path=None):
         global USERNAME, RACENAME
         USERNAME = username
@@ -438,7 +439,6 @@ class VehicleTrackerApp:
             #NOTE: this is where it breaks
             output = self.classification_model(roi_tensor)
             probabilities = F.softmax(output, dim=1)
-
             max_logit, pred_class = torch.max(output, 1)
             predicted_class_name = self.class_labels[pred_class.item()]
             max_logit = max_logit.item()
