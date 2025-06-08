@@ -66,9 +66,8 @@ class VehicleTrackerApp:
         print("Loading YOLOv9s model...")
         self.yolov9_model = YOLO("./yoloModels/yolov9s.pt").to(self.device)
 
-        
         # Load configuration and models
-        yaml_data = load_yaml("../config/config_20a8ffdc.yaml")
+        yaml_data = load_yaml("/home/machvision/Documents/ptz_software/src/ml/object_detection/config/config_55dc90ad.yaml")
         self.class_labels, num_classes = parse_class_data(yaml_data)
 
         model_classification_start_time = time.time()
@@ -76,7 +75,7 @@ class VehicleTrackerApp:
         self.classification_model = models.resnet18(weights='IMAGENET1K_V1')
         print(f"Classification model loaded in {time.time() - model_classification_start_time:.2f} seconds\n")
         self.classification_model.fc = nn.Linear(self.classification_model.fc.in_features, num_classes)
-        self.classification_model.load_state_dict(torch.load("../config/best.pt"))
+        self.classification_model.load_state_dict(torch.load("/home/machvision/Documents/ptz_software/src/ml/object_detection/config/best.pt"))
         print(f"Finished loading classification omdel in {time.time() - model_classification_start_time:.2f} seconds\n")
         self.classification_model.to(self.device)
         self.classification_model.eval()
