@@ -17,6 +17,7 @@ def split_dataset(source_dir, train_dir, val_dir, split_ratio=0.8):
         os.makedirs(train_dir)
     if not os.path.exists(val_dir):
         os.makedirs(val_dir)
+    print(train_dir, val_dir)
 
     # Loop through each class folder in the source dataset
     for class_name in os.listdir(source_dir):

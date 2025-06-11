@@ -2,3 +2,5 @@ medranovenv/
 venv/
 .env
 **/.DS_Store
+dataset/
+src/v1_deployment/sim_vehicle_dataset/

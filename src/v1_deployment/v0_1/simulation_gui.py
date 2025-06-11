@@ -67,7 +67,7 @@ class VehicleTrackerApp:
         self.yolov9_model = YOLO("./yoloModels/yolov9s.pt").to(self.device)
 
         # Load configuration and models
-        yaml_data = load_yaml("/home/machvision/Documents/ptz_software/src/ml/object_detection/config/config_55dc90ad.yaml")
+        yaml_data = load_yaml("/home/machvision/Documents/ptz_software/src/ml/object_detection/config/config_3d5d1f50.yaml")
         self.class_labels, num_classes = parse_class_data(yaml_data)
 
         model_classification_start_time = time.time()
@@ -336,16 +336,19 @@ class VehicleTrackerApp:
         """Runs CNN classification and applies both logit thresholding and entropy filtering."""
 
         with torch.no_grad():
-            #NOTE: this is where it breaks
             output = self.classification_model(roi_tensor)
             probabilities = F.softmax(output, dim=1)
+            print(f"Probabilities: {probabilities}")
             max_logit, pred_class = torch.max(output, 1)
+            print(f"Max logit: {max_logit.item()}, Predicted class index: {pred_class.item()}")
             predicted_class_name = self.class_labels[pred_class.item()]
+            print(f"Predicted class: {predicted_class_name}, Logit: {max_logit.item()}")
             max_logit = max_logit.item()
+            print(f"Max logit: {max_logit}")
             entropy = -torch.sum(probabilities * torch.log(probabilities + 1e-10)).item()
 
-            if entropy > entropy_threshold:
-                return f"Unknown ({max_logit:.2f}, entropy: {entropy:.2f})"
+            # if entropy > entropy_threshold:
+            #     return f"Unknown ({max_logit:.2f}, entropy: {entropy:.2f})"
             
             return f"{predicted_class_name} ({max_logit:.2f}, entropy: {entropy:.2f})"
 
@@ -365,7 +368,7 @@ class VehicleTrackerApp:
             img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
 
             print("running yolo detection")
-            results = self.yolov9_model.predict(img_rgb, classes=[2], verbose=True, imgsz=480)
+            results = self.yolov9_model.predict(img_rgb, classes=[2], verbose=False, imgsz=480)
             # print(results)
             # print("\n")
             annotated_frame = img_resized.copy()
@@ -382,28 +385,18 @@ class VehicleTrackerApp:
                     conf = box.conf[0].item()
                     if conf > 0.3:
                         # Compute center coordinates.
-                        print("Computing center coordinates")
-                        print(f"x1: {x1} x2: {x2}\n")
-                        print(f"y1: {y1} y2: {y2}\n")
-
                         x_center, y_center = (x1 + x2) / (2) , (y1 + y2) / (2)
-                        print(f"x center: {x_center}\n")
-                        print(f"y center: {y_center}\n")
 
                         # Extract ROI for classification
                         roi = img_rgb[y1:y2, x1:x2]
-                        print(f"roi: {roi}")
 
                         if roi.size > 0:
                             roi_pil = Image.fromarray(roi)
                             roi_tensor = self.transform(roi_pil).unsqueeze(0).to(self.device)
 
                             # # Get classification result synchronously
-                            print("calling classification function")
                             classification_result = self.classify_vehicle(roi_tensor)
-                            print("post classification")
                             vehicle_class_name = classification_result.split(" (")[0]  # Extract just the class name
-                            print("start classification on a seperate thread")
                             # Run classification in a separate thread
                             thread = Thread(target=lambda: vehicle_positions.append(
                                 f"Vehicle {idx+1}: {classification_result} ({x_center}, {y_center})"
@@ -411,7 +404,6 @@ class VehicleTrackerApp:
                             threads.append(thread)
                             thread.start()
 
-                            print("drawing boudning box based on detection")
                             # Draw bounding box
                             # if self.tracking_enabled and vehicle_class_name == self.selected_label.get(): 
                             #     bbox_color = (0, 255, 0)  # Green for tracked vehicle
