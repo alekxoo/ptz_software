@@ -149,6 +149,14 @@ def main():
     cudnn.benchmark = True
     plt.ion()   # interactive mode
 
+
+    # QUESTION: Does this data transform increase the number of images in the dataset?
+    # ANSWER: No, it does not increase the number of images. It applies transformations like resizing, cropping, and normalization to the existing images.
+    # QUESTION: Is it better to increase the number of images where we keep the original images and the transformed images are added to the dataset instead of replacing the existing ones?
+    # ANSWER: Yes, increasing the number of images by keeping both original and transformed images can help improve model generalization and robustness. This is known as data augmentation.
+    # QUESTION: So what I'm currently doing isn't data augmentation since I'm replacing the original images with transformed ones?
+    # ANSWER: Correct, the current approach is not data augmentation. Data augmentation typically involves applying transformations to the original images while keeping them in the dataset, thus increasing the diversity of training data without losing the original images.
+    
     data_transforms = {
         'train': transforms.Compose([
             transforms.RandomResizedCrop(224),
@@ -164,12 +172,6 @@ def main():
         ]),
     }
 
-    """
-    the following lines of code may give the most trouble on AWS if we are pulling from buckets of images
-    current_dir gets the directory the code is running in
-    data_dir then finds the directory where the folder 'dataset is', within 'dataset' will be 'train/val' folders, may need to split images later when getting the user's images
-    once we are able to get the images into train/val folders then this should work
-    """
     current_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(current_dir, '..', 'dataset')
     data_dir = os.path.normpath(data_dir)
@@ -183,10 +185,10 @@ def main():
     print(f"Image Datasets: {image_datasets}")
 
     dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], 
-                                                 batch_size=4,
-                                                 shuffle=True, 
-                                                 num_workers=4)  # number of subprocesses to fetch data at a time
-                  for x in ['train', 'val']}
+                                                    batch_size=4,
+                                                    shuffle=True, 
+                                                    num_workers=4)  # number of subprocesses to fetch data at a time
+                    for x in ['train', 'val']}
 
     dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val']}
     class_names = image_datasets['train'].classes
