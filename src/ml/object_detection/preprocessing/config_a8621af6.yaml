@@ -1,0 +1,16 @@
+classes:
+- id: 1
+  label: 1_Miata_red
+- id: 2
+  label: 2_Hyperion2020_9
+- id: 3
+  label: 3_Hyperion2020_38
+- id: 4
+  label: 4_TeslaM3_White
+- id: 5
+  label: 5_Hyperion2020_65
+- id: 6
+  label: 6_TeslaM3_Red
+num_classes: 6
+user:
+  full_name: Alex Koo
