@@ -27,12 +27,12 @@ def parse_class_data(data):
     num_classes = data['num_classes']
     return class_labels, num_classes
 
-yaml_data = load_yaml("/home/machvision/Documents/ptz_software/src/ml/object_detection/preprocessing/config_a8621af6.yaml")
+yaml_data = load_yaml("./config_a8621af6.yaml")
 class_labels, num_classes = parse_class_data(yaml_data)
 
 classification_model = models.resnet18(weights='IMAGENET1K_V1')
 classification_model.fc = nn.Linear(classification_model.fc.in_features, num_classes)
-classification_model.load_state_dict(torch.load("/home/machvision/Documents/ptz_software/src/ml/object_detection/training/best.pt"))
+classification_model.load_state_dict(torch.load("./best.pt"))
 classification_model.to(device) 
 classification_model.eval()
 
