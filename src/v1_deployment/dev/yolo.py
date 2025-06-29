@@ -36,6 +36,8 @@ classification_model.load_state_dict(torch.load("/home/machvision/Documents/ptz_
 classification_model.to(device) 
 classification_model.eval()
 
+
+
 def get_visible_cars_at_timestamp(detection_timestamp, csv_path='all_car_positions.csv', 
                                 width=854, height=480, max_time_diff=5000):
     """
@@ -103,6 +105,35 @@ def get_visible_cars_at_timestamp(detection_timestamp, csv_path='all_car_positio
         
         return int(screen_x), int(screen_y)
     
+
+    def calculate_projected_size(car_pos, camera_pos, camera_look, fov, width, height, 
+                           car_length=4.5, car_height=1.5):
+        """Calculate how big a car would appear on screen in pixels"""
+        # Calculate distance from camera to car
+        to_car = car_pos - camera_pos
+        
+        # Normalize camera look direction
+        look_dir = camera_look / np.linalg.norm(camera_look)
+        
+        # Calculate distance along camera's forward direction
+        distance = np.dot(to_car, look_dir)
+        
+        # If behind camera, return None
+        if distance <= 0:
+            return None
+        
+        # Convert FOV to radians and calculate focal length
+        fov_rad = np.radians(fov)
+        focal_length = 1.0 / np.tan(fov_rad / 2.0)
+        
+        # Calculate projected size in pixels
+        # Use car_width for screen width projection (side view)
+        # Use car_height for screen height projection
+        width_pixels = (car_length * focal_length * width) / distance
+        height_pixels = (car_height * focal_length * height) / distance
+        
+        return abs(width_pixels), abs(height_pixels)
+    
     try:
         # Read the CSV file
         df = pd.read_csv(csv_path)
@@ -142,12 +173,25 @@ def get_visible_cars_at_timestamp(detection_timestamp, csv_path='all_car_positio
         fov = frame_data.iloc[0]['camera_fov']
         
         visible_cars = []
+        min_width, min_height = 50, 30  # ADD THIS LINE - minimum detectable size
         
         # Project and check visibility for each car
         for _, row in frame_data.iterrows():
             car_id = int(row['car_id'])
             car_pos = np.array([row['x'], row['y'], row['z']])
+
+            projected_size = calculate_projected_size(car_pos, camera_pos, camera_look, fov, width, height)
+
+            if projected_size is None:
+                continue  # Behind camera
+
+            width_pixels, height_pixels = projected_size
             
+            # ADD THIS: Skip cars that are too small to detect
+            if width_pixels < min_width or height_pixels < min_height:
+                print(f"Car {car_id} too small to detect: width={width_pixels}, height={height_pixels}")
+                continue  # Too small for YOLO to detect
+
             # Project to screen
             screen_coords = project_to_screen(car_pos, camera_pos, camera_look, fov)
             
@@ -318,5 +362,10 @@ def vehicle_detection(img, save_bool=False, relative_time=None, timestamp=None):
             annotated_frame = add_sim_cars_to_image(annotated_frame, timestamp)
         cv2.imwrite(f"{annotated_image_path}annotated_image_{relative_time}.png", annotated_frame)
     return car_coodinates
+
+
+
+
+
 
 
