@@ -67,7 +67,7 @@ class VehicleTrackerApp:
         self.yolov9_model = YOLO("./yoloModels/yolov9s.pt").to(self.device)
 
         # Load configuration and models
-        yaml_data = load_yaml("/home/machvision/Documents/ptz_software/src/ml/object_detection/config/config_3d5d1f50.yaml")
+        yaml_data = load_yaml("/home/machvision/Documents/ptz_software/src/ml/object_detection/config/config_a8621af6.yaml")
         self.class_labels, num_classes = parse_class_data(yaml_data)
 
         model_classification_start_time = time.time()
