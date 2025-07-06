@@ -27,7 +27,7 @@ from datetime import datetime
 
 # Import our new PTZ controller
 from PTZControl import ptz_controller, vel_x, vel_y
-from PIDControl import PID
+from PIDControl import PID_with_zoom, set_target_vehicle_size, set_zoom_enabled, PID
 
 sys.path.append("/home/machvision/Documents/senior-design/src/embedded")
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -37,61 +37,43 @@ load_dotenv()
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-class FullQualityVideoRecorder:
+class OverlayVideoRecorder:
     def __init__(self):
         self.is_recording = False
         self.video_writer = None
-        self.output_folder = "FullQualityVideos"
+        self.output_folder = "OverlayVideos"
         os.makedirs(self.output_folder, exist_ok=True)
-        self.frame_queue = []
-        self.lock = threading.Lock()
         
-    def start_recording(self, frame_size=(3840, 2160), fps=30):
+    def start_recording(self, frame_size=(854, 480), fps=30):
         if self.is_recording:
             return False
             
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.output_path = os.path.join(self.output_folder, f"full_quality_{timestamp}.mp4")
+        self.output_path = os.path.join(self.output_folder, f"overlay_{timestamp}.mp4")
         
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         self.video_writer = cv2.VideoWriter(self.output_path, fourcc, fps, frame_size)
         
         if not self.video_writer.isOpened():
-            print("ERROR: Could not open video writer!")
+            print("ERROR: Could not open overlay video writer!")
             return False
             
         self.is_recording = True
-        self.frame_queue = []
-        
-        self.writer_thread = threading.Thread(target=self._write_frames_worker, daemon=True)
-        self.writer_thread.start()
-        
-        print(f"Started recording: {self.output_path}")
+        print(f"Started overlay recording: {self.output_path}")
         return True
     
     def add_frame(self, frame):
-        if not self.is_recording:
+        """Add processed frame with overlays"""
+        if not self.is_recording or self.video_writer is None:
             return
             
-        with self.lock:
-            self.frame_queue.append(frame.copy())
-            if len(self.frame_queue) > 150:
-                self.frame_queue.pop(0)
-    
-    def _write_frames_worker(self):
-        while self.is_recording:
-            frames_to_write = []
-            
-            with self.lock:
-                if self.frame_queue:
-                    frames_to_write = self.frame_queue.copy()
-                    self.frame_queue.clear()
-            
-            for frame in frames_to_write:
-                if self.video_writer and self.is_recording:
-                    self.video_writer.write(frame)
-            
-            time.sleep(0.01)
+        # Convert from RGB to BGR if needed
+        if len(frame.shape) == 3 and frame.shape[2] == 3:
+            # Assume it's RGB, convert to BGR for OpenCV
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            self.video_writer.write(frame_bgr)
+        else:
+            self.video_writer.write(frame)
     
     def stop_recording(self):
         if not self.is_recording:
@@ -99,19 +81,11 @@ class FullQualityVideoRecorder:
             
         self.is_recording = False
         
-        if hasattr(self, 'writer_thread'):
-            self.writer_thread.join(timeout=5.0)
-        
-        with self.lock:
-            for frame in self.frame_queue:
-                if self.video_writer:
-                    self.video_writer.write(frame)
-        
         if self.video_writer:
             self.video_writer.release()
             self.video_writer = None
         
-        print(f"Video saved: {self.output_path}")
+        print(f"Overlay recording saved: {self.output_path}")
 
 
 def load_yaml(file_path):
@@ -143,7 +117,21 @@ class VehicleTrackerApp:
         # Bind keyboard events for PTZ control
         self.root.bind('<KeyPress>', self.on_key_press)
         self.root.focus_set()  # Ensure window can receive keyboard events
-        
+
+        self.zoom_enabled = tk.BooleanVar(value=True)
+        self.target_vehicle_size = tk.DoubleVar(value=0.2)  # Default to 1/5 screen
+
+        self.tracking_mode = tk.StringVar(value="specific")  # "specific" or "any"
+        self.tracked_vehicle_id = None  # For tracking specific vehicle in "any" mode
+
+        # PID control variables
+        self.pid_px = tk.DoubleVar(value=15.0)   # Pan proportional
+        self.pid_ix = tk.DoubleVar(value=0.2)    # Pan integral
+        self.pid_py = tk.DoubleVar(value=-15.0)  # Tilt proportional  
+        self.pid_iy = tk.DoubleVar(value=0.1)    # Tilt integral
+        self.pid_pz = tk.DoubleVar(value=2.0)    # Zoom proportional
+        self.pid_iz = tk.DoubleVar(value=0.05)   # Zoom integral
+                
         # Set up device
         cudnn.benchmark = True
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -174,12 +162,15 @@ class VehicleTrackerApp:
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
+
+        # Generate unique timestamp for this session
+        session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         gst = ("v4l2src device=/dev/video0 ! "
             "image/jpeg,width=3840,height=2160,framerate=30/1 ! "
             "jpegparse ! tee name=t "
             "t. ! queue max-size-buffers=1 leaky=downstream ! "
-            "avimux ! filesink location=video.avi "
+            f"avimux ! filesink location=full_quality_{session_timestamp}.avi "
             "t. ! queue max-size-buffers=1 leaky=downstream ! "
             "jpegdec ! videoscale ! "
             "video/x-raw,width=854,height=480,format=BGR ! "
@@ -198,14 +189,35 @@ class VehicleTrackerApp:
         self.track_status = tk.StringVar(value="Not Tracking")
         self.vehicle_position = tk.StringVar(value="N/A")
         
-        # Video recording variables
-        self.is_recording = False
-        self.out = None  # For writing video
+        # Video recording variables - Simple overlay recorder only
+        self.overlay_recorder = OverlayVideoRecorder()
 
         # Schedule the first update of the webcam frame
-        self.full_quality_recorder = FullQualityVideoRecorder()
         self.create_ui()
         self.update_frame()
+        self.on_pid_change()
+
+    def on_pid_change(self, *args):
+        """Handle PID gain changes"""
+        from PIDControl import set_pid_gains
+        set_pid_gains(
+            px=self.pid_px.get(),
+            ix=self.pid_ix.get(), 
+            py=self.pid_py.get(),
+            iy=self.pid_iy.get(),
+            pz=self.pid_pz.get(),
+            iz=self.pid_iz.get()
+        )
+
+    def reset_pid_defaults(self):
+        """Reset PID gains to default values"""
+        self.pid_px.set(15.0)
+        self.pid_ix.set(0.2)
+        self.pid_py.set(-15.0)
+        self.pid_iy.set(0.1)
+        self.pid_pz.set(2.0)
+        self.pid_iz.set(0.05)
+        self.on_pid_change()
 
     def on_key_press(self, event):
         """Handle keyboard input for PTZ control"""
@@ -292,22 +304,175 @@ class VehicleTrackerApp:
             # Vehicle Tracking Controls
             ctk.CTkLabel(self.mode_content_frame, text="Vehicle Tracking", font=("Arial", 16, "bold")).pack(pady=(0, 10))
             
+            # Tracking Mode Selection
+            mode_frame = ctk.CTkFrame(self.mode_content_frame)
+            mode_frame.pack(fill="x", pady=(0, 10))
+            
+            ctk.CTkLabel(mode_frame, text="Tracking Mode:", font=("Arial", 12, "bold")).pack(pady=(0, 5))
+            
+            mode_buttons_frame = ctk.CTkFrame(mode_frame)
+            mode_buttons_frame.pack()
+            
+            self.specific_mode_btn = ctk.CTkButton(mode_buttons_frame, text="Specific Vehicle", width=140, height=30,
+                                                command=lambda: self.set_tracking_mode("specific"))
+            self.specific_mode_btn.pack(side="left", padx=5)
+            
+            self.any_mode_btn = ctk.CTkButton(mode_buttons_frame, text="Any Vehicle", width=140, height=30,
+                                            command=lambda: self.set_tracking_mode("any"))
+            self.any_mode_btn.pack(side="left", padx=5)
+            
+            # Update button colors based on current mode
+            self.update_mode_buttons()
+            
             self.track_button = ctk.CTkButton(self.mode_content_frame, text="Start Tracking", command=self.toggle_tracking)
             self.track_button.pack(pady=5)
             
-            ctk.CTkLabel(self.mode_content_frame, text="Select Vehicle:").pack(pady=(10, 0))
-            self.vehicle_menu = ctk.CTkComboBox(self.mode_content_frame, values=self.class_labels, variable=self.selected_label)
-            self.vehicle_menu.pack(pady=5)
+            # Vehicle selection (only show in specific mode)
+            self.vehicle_selection_frame = ctk.CTkFrame(self.mode_content_frame)
+            if self.tracking_mode.get() == "specific":
+                self.vehicle_selection_frame.pack(fill="x", pady=(5, 0))
+                ctk.CTkLabel(self.vehicle_selection_frame, text="Select Vehicle Type:").pack(pady=(5, 0))
+                self.vehicle_menu = ctk.CTkComboBox(self.vehicle_selection_frame, values=self.class_labels, variable=self.selected_label)
+                self.vehicle_menu.pack(pady=5)
             
+            # Zoom Control Section
+            zoom_frame = ctk.CTkFrame(self.mode_content_frame)
+            zoom_frame.pack(fill="x", pady=10)
+            
+            ctk.CTkLabel(zoom_frame, text="Autonomous Zoom Control", font=("Arial", 14, "bold")).pack(pady=(0, 5))
+            
+            # Zoom enable/disable checkbox
+            zoom_checkbox = ctk.CTkCheckBox(zoom_frame, text="Enable Auto-Zoom", 
+                                        variable=self.zoom_enabled, command=self.on_zoom_toggle)
+            zoom_checkbox.pack(pady=2)
+            
+            # Target vehicle size slider
+            ctk.CTkLabel(zoom_frame, text="Target Vehicle Size:", font=("Arial", 12)).pack(pady=(10, 0))
+            
+            size_frame = ctk.CTkFrame(zoom_frame)
+            size_frame.pack(fill="x", pady=5)
+            
+            self.size_slider = ctk.CTkSlider(size_frame, from_=0.05, to=0.4, number_of_steps=35,
+                                        variable=self.target_vehicle_size, command=self.on_size_change)
+            self.size_slider.pack(fill="x", padx=10, pady=5)
+            
+            self.size_label = ctk.CTkLabel(size_frame, text="20% of screen (1/5)")
+            self.size_label.pack(pady=2)
+            
+            # Quick preset buttons
+            preset_frame = ctk.CTkFrame(zoom_frame)
+            preset_frame.pack(fill="x", pady=5)
+            
+            ctk.CTkLabel(preset_frame, text="Quick Presets:", font=("Arial", 11)).pack()
+            
+            preset_buttons_frame = ctk.CTkFrame(preset_frame)
+            preset_buttons_frame.pack()
+            
+            ctk.CTkButton(preset_buttons_frame, text="1/8 (12.5%)", width=80, height=25,
+                        command=lambda: self.set_preset_size(0.125)).pack(side="left", padx=2)
+            ctk.CTkButton(preset_buttons_frame, text="1/6 (16.7%)", width=80, height=25,
+                        command=lambda: self.set_preset_size(0.167)).pack(side="left", padx=2)
+            ctk.CTkButton(preset_buttons_frame, text="1/5 (20%)", width=80, height=25,
+                        command=lambda: self.set_preset_size(0.2)).pack(side="left", padx=2)
+            ctk.CTkButton(preset_buttons_frame, text="1/4 (25%)", width=80, height=25,
+                        command=lambda: self.set_preset_size(0.25)).pack(side="left", padx=2)
+            
+
+            # PID Control Section
+            pid_frame = ctk.CTkFrame(self.mode_content_frame)
+            pid_frame.pack(fill="x", pady=10)
+
+            ctk.CTkLabel(pid_frame, text="PID Gains", font=("Arial", 14, "bold")).pack(pady=(0, 5))
+
+            # Pan controls
+            pan_pid_frame = ctk.CTkFrame(pid_frame)
+            pan_pid_frame.pack(fill="x", pady=2)
+            ctk.CTkLabel(pan_pid_frame, text="Pan:", font=("Arial", 11, "bold"), width=50).pack(side="left")
+
+            ctk.CTkLabel(pan_pid_frame, text="P:", width=20).pack(side="left", padx=(10,0))
+            px_slider = ctk.CTkSlider(pan_pid_frame, from_=0.1, to=30.0, number_of_steps=299,
+                                    variable=self.pid_px, command=lambda x: self.on_pid_change(), width=80)
+            px_slider.pack(side="left", padx=2)
+            px_label = ctk.CTkLabel(pan_pid_frame, text=f"{self.pid_px.get():.1f}", width=30)
+            px_label.pack(side="left")
+            self.pid_px.trace_add('write', lambda *args: px_label.configure(text=f"{self.pid_px.get():.1f}"))
+
+            ctk.CTkLabel(pan_pid_frame, text="I:", width=20).pack(side="left", padx=(10,0))
+            ix_slider = ctk.CTkSlider(pan_pid_frame, from_=0.0, to=2.0, number_of_steps=200,
+                                    variable=self.pid_ix, command=lambda x: self.on_pid_change(), width=80)
+            ix_slider.pack(side="left", padx=2)
+            ix_label = ctk.CTkLabel(pan_pid_frame, text=f"{self.pid_ix.get():.2f}", width=30)
+            ix_label.pack(side="left")
+            self.pid_ix.trace_add('write', lambda *args: ix_label.configure(text=f"{self.pid_ix.get():.2f}"))
+
+            # Tilt controls
+            tilt_pid_frame = ctk.CTkFrame(pid_frame)
+            tilt_pid_frame.pack(fill="x", pady=2)
+            ctk.CTkLabel(tilt_pid_frame, text="Tilt:", font=("Arial", 11, "bold"), width=50).pack(side="left")
+
+            ctk.CTkLabel(tilt_pid_frame, text="P:", width=20).pack(side="left", padx=(10,0))
+            py_slider = ctk.CTkSlider(tilt_pid_frame, from_=-30.0, to=30.0, number_of_steps=600,
+                                    variable=self.pid_py, command=lambda x: self.on_pid_change(), width=80)
+            py_slider.pack(side="left", padx=2)
+            py_label = ctk.CTkLabel(tilt_pid_frame, text=f"{self.pid_py.get():.1f}", width=30)
+            py_label.pack(side="left")
+            self.pid_py.trace_add('write', lambda *args: py_label.configure(text=f"{self.pid_py.get():.1f}"))
+
+            ctk.CTkLabel(tilt_pid_frame, text="I:", width=20).pack(side="left", padx=(10,0))
+            iy_slider = ctk.CTkSlider(tilt_pid_frame, from_=0.0, to=2.0, number_of_steps=200,
+                                    variable=self.pid_iy, command=lambda x: self.on_pid_change(), width=80)
+            iy_slider.pack(side="left", padx=2)
+            iy_label = ctk.CTkLabel(tilt_pid_frame, text=f"{self.pid_iy.get():.2f}", width=30)
+            iy_label.pack(side="left")
+            self.pid_iy.trace_add('write', lambda *args: iy_label.configure(text=f"{self.pid_iy.get():.2f}"))
+
+            # Zoom controls
+            zoom_pid_frame = ctk.CTkFrame(pid_frame)
+            zoom_pid_frame.pack(fill="x", pady=2)
+            ctk.CTkLabel(zoom_pid_frame, text="Zoom:", font=("Arial", 11, "bold"), width=50).pack(side="left")
+
+            ctk.CTkLabel(zoom_pid_frame, text="P:", width=20).pack(side="left", padx=(10,0))
+            pz_slider = ctk.CTkSlider(zoom_pid_frame, from_=0.1, to=10.0, number_of_steps=99,
+                                    variable=self.pid_pz, command=lambda x: self.on_pid_change(), width=80)
+            pz_slider.pack(side="left", padx=2)
+            pz_label = ctk.CTkLabel(zoom_pid_frame, text=f"{self.pid_pz.get():.1f}", width=30)
+            pz_label.pack(side="left")
+            self.pid_pz.trace_add('write', lambda *args: pz_label.configure(text=f"{self.pid_pz.get():.1f}"))
+
+            ctk.CTkLabel(zoom_pid_frame, text="I:", width=20).pack(side="left", padx=(10,0))
+            iz_slider = ctk.CTkSlider(zoom_pid_frame, from_=0.0, to=0.5, number_of_steps=50,
+                                    variable=self.pid_iz, command=lambda x: self.on_pid_change(), width=80)
+            iz_slider.pack(side="left", padx=2)
+            iz_label = ctk.CTkLabel(zoom_pid_frame, text=f"{self.pid_iz.get():.3f}", width=30)
+            iz_label.pack(side="left")
+            self.pid_iz.trace_add('write', lambda *args: iz_label.configure(text=f"{self.pid_iz.get():.3f}"))
+
+            # Reset button
+            reset_pid_btn = ctk.CTkButton(pid_frame, text="Reset to Defaults", 
+                                        command=self.reset_pid_defaults, width=120, height=25)
+            reset_pid_btn.pack(pady=(5, 0))
+
             # Status display
             status_frame = ctk.CTkFrame(self.mode_content_frame)
             status_frame.pack(fill="x", pady=10)
             
-            ctk.CTkLabel(status_frame, text="Status:", font=("Arial", 12, "bold")).pack()
+            ctk.CTkLabel(status_frame, text="Tracking Status:", font=("Arial", 12, "bold")).pack()
             ctk.CTkLabel(status_frame, textvariable=self.track_status, font=("Arial", 12)).pack()
             
             ctk.CTkLabel(status_frame, text="Position:", font=("Arial", 12, "bold")).pack(pady=(10, 0))
             ctk.CTkLabel(status_frame, textvariable=self.vehicle_position, font=("Arial", 12)).pack()
+
+            # Add vehicle size display
+            ctk.CTkLabel(status_frame, text="Vehicle Size:", font=("Arial", 12, "bold")).pack(pady=(10, 0))
+            if not hasattr(self, 'vehicle_size_var'):
+                self.vehicle_size_var = tk.StringVar(value="N/A")
+            ctk.CTkLabel(status_frame, textvariable=self.vehicle_size_var, font=("Arial", 12)).pack()
+            
+            # Add tracked vehicle info (for any mode)
+            if not hasattr(self, 'tracked_vehicle_info'):
+                self.tracked_vehicle_info = tk.StringVar(value="N/A")
+            ctk.CTkLabel(status_frame, text="Tracking:", font=("Arial", 12, "bold")).pack(pady=(10, 0))
+            ctk.CTkLabel(status_frame, textvariable=self.tracked_vehicle_info, font=("Arial", 12)).pack()
 
         elif self.current_mode.get() == "ptz":
             # PTZ Manual Controls
@@ -322,7 +487,7 @@ class VehicleTrackerApp:
             
             # Home button
             home_btn = ctk.CTkButton(self.mode_content_frame, text="🏠 Home Position", 
-                                   command=self.go_home, width=200, height=40)
+                                command=self.go_home, width=200, height=40)
             home_btn.pack(pady=10)
             
             # Pan controls
@@ -369,6 +534,99 @@ class VehicleTrackerApp:
         elif self.current_mode.get() == "quit":
             self.on_closing()
 
+    def on_zoom_toggle(self):
+        """Handle zoom enable/disable"""
+        zoom_enabled = self.zoom_enabled.get()
+        set_zoom_enabled(zoom_enabled)
+        print(f"Auto-zoom {'enabled' if zoom_enabled else 'disabled'}")
+
+    def on_size_change(self, value):
+        """Handle target size slider change"""
+        size_ratio = float(value)
+        set_target_vehicle_size(size_ratio)
+        percentage = size_ratio * 100
+        fraction_text = self.get_fraction_text(size_ratio)
+        self.size_label.configure(text=f"{percentage:.1f}% of screen {fraction_text}")
+
+    def set_preset_size(self, size_ratio):
+        """Set preset vehicle size"""
+        self.target_vehicle_size.set(size_ratio)
+        self.on_size_change(size_ratio)
+
+    def get_fraction_text(self, ratio):
+        """Convert ratio to approximate fraction text"""
+        fractions = {
+            0.125: "(1/8)",
+            0.167: "(1/6)", 
+            0.2: "(1/5)",
+            0.25: "(1/4)",
+            0.33: "(1/3)"
+        }
+        
+        # Find closest fraction
+        closest = min(fractions.keys(), key=lambda x: abs(x - ratio))
+        if abs(closest - ratio) < 0.02:  # Within 2%
+            return fractions[closest]
+        return ""
+
+    def set_tracking_mode(self, mode):
+        """Set tracking mode (specific or any)"""
+        self.tracking_mode.set(mode)
+        self.tracked_vehicle_id = None  # Reset tracked vehicle
+        self.update_controls()  # Refresh UI
+        print(f"Tracking mode set to: {mode}")
+
+    def update_mode_buttons(self):
+        """Update tracking mode button colors"""
+        if self.tracking_mode.get() == "specific":
+            self.specific_mode_btn.configure(fg_color=("gray75", "gray25"))  # Active
+            self.any_mode_btn.configure(fg_color=("gray85", "gray15"))      # Inactive
+        else:
+            self.any_mode_btn.configure(fg_color=("gray75", "gray25"))      # Active
+            self.specific_mode_btn.configure(fg_color=("gray85", "gray15")) # Inactive
+
+    def find_best_vehicle_to_track(self, detected_vehicles):
+        """
+        Find the best vehicle to track in 'any' mode
+        Priority: 1) Currently tracked vehicle if still visible
+                2) Largest vehicle (closest/most prominent)
+                3) Most centered vehicle
+        """
+        if not detected_vehicles:
+            return None
+            
+        # If we're already tracking a vehicle, try to find it again
+        if self.tracked_vehicle_id is not None:
+            for vehicle in detected_vehicles:
+                if vehicle['id'] == self.tracked_vehicle_id:
+                    return vehicle
+        
+        # Find best new vehicle to track
+        best_vehicle = None
+        best_score = -1
+        
+        frame_center_x = 0.5  # Normalized center
+        frame_center_y = 0.5
+        
+        for vehicle in detected_vehicles:
+            # Calculate score based on size and distance from center
+            size_score = vehicle['size_ratio'] * 2  # Larger vehicles get higher score
+            
+            # Distance from center (closer to center = higher score)
+            center_x = vehicle['center_norm'][0]
+            center_y = vehicle['center_norm'][1]
+            distance_from_center = ((center_x - frame_center_x)**2 + (center_y - frame_center_y)**2)**0.5
+            center_score = max(0, 1.0 - distance_from_center)
+            
+            # Combined score (size weighted more heavily)
+            total_score = size_score + center_score * 0.5
+            
+            if total_score > best_score:
+                best_score = total_score
+                best_vehicle = vehicle
+        
+        return best_vehicle
+
     def go_home(self):
         """Return PTZ camera to home position"""
         ptz_controller.go_home()
@@ -391,17 +649,58 @@ class VehicleTrackerApp:
             self.vehicle_position.set("N/A")
 
     def record_and_save(self):
-        if self.full_quality_recorder.is_recording:
-            self.full_quality_recorder.stop_recording()
+        """Simple overlay recording function"""
+        if self.overlay_recorder.is_recording:
+            self.overlay_recorder.stop_recording()
             self.record_button.configure(text="Start Recording")
         else:
-            self.full_quality_recorder.start_recording(frame_size=(3840, 2160), fps=30)
-            self.record_button.configure(text="Stop Recording")
+            success = self.overlay_recorder.start_recording(frame_size=(854, 480), fps=30)
+            if success:
+                self.record_button.configure(text="Stop Recording")
+            else:
+                print("Failed to start overlay recording")
 
-    #function to compute max logit of classification and entropy loss
+    def add_metadata_overlay(self, frame):
+        """Add metadata overlay to top-left corner of frame"""
+        # Get current PTZ position
+        pan, tilt, zoom = ptz_controller.get_position()
+        
+        # Prepare metadata text
+        metadata_lines = [
+            f"Pan: {pan}",
+            f"Tilt: {tilt}", 
+            f"Zoom: {zoom}",
+            f"PID P: {self.pid_px.get():.1f}, {self.pid_py.get():.1f}, {self.pid_pz.get():.1f}",
+            f"PID I: {self.pid_ix.get():.2f}, {self.pid_iy.get():.2f}, {self.pid_iz.get():.2f}",
+            f"Target Size: {self.target_vehicle_size.get():.2f}",
+            f"Auto-Zoom: {'ON' if self.zoom_enabled.get() else 'OFF'}",
+            f"Mode: {self.tracking_mode.get().title()}"
+        ]
+        
+        # Background rectangle dimensions
+        line_height = 20
+        padding = 5
+        bg_width = 320
+        bg_height = len(metadata_lines) * line_height + padding * 2
+        
+        # Draw semi-transparent background
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (bg_width, bg_height), (0, 0, 0), -1)
+        alpha = 0.7  # Transparency level
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        
+        # Add text lines
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        color = (255, 255, 255)  # White text
+        thickness = 1
+        
+        for i, line in enumerate(metadata_lines):
+            y_position = padding + (i + 1) * line_height
+            cv2.putText(frame, line, (padding, y_position), font, font_scale, color, thickness)
+
     def classify_vehicle(self, roi_tensor, logit_threshold=2, entropy_threshold=0.5):
         """Runs CNN classification and applies both logit thresholding and entropy filtering."""
-
         with torch.no_grad():
             output = self.classification_model(roi_tensor)
             probabilities = F.softmax(output, dim=1)
@@ -425,22 +724,22 @@ class VehicleTrackerApp:
                 self.root.after(100, self.update_frame)
                 return
             
-            if self.full_quality_recorder.is_recording:
-                self.full_quality_recorder.add_frame(img)
             old_time = time.time()
             
             # Scale down for inference to 480p
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-            print("running yolo detection")
             results = self.yolov9_model.predict(img_rgb, classes=[2], verbose=False, imgsz=480)
             annotated_frame = img_rgb.copy()
             vehicle_found = False
             vehicle_positions = []
             threads = []
+            detected_vehicles = []  # Store all detected vehicles for "any" mode
 
             tracking_vehicle_x = 0.0
             tracking_vehicle_y = 0.0
+            tracking_bbox = None
+            vehicle_size_ratio = 0.0
+            tracked_vehicle_class = ""
             
             if hasattr(results[0], 'boxes') and len(results[0].boxes) > 0:
                 for idx, box in enumerate(results[0].boxes):
@@ -450,6 +749,11 @@ class VehicleTrackerApp:
                         # Compute center coordinates normalized for PID
                         x_center, y_center = (x1 + x2) / (2 * img_rgb.shape[1]) , (y1 + y2) / (2 * img_rgb.shape[0])
                         x_center_pixel, y_center_pixel = (x1 + x2) / 2, (y1 + y2) / 2
+
+                        # Calculate vehicle size ratio
+                        bbox_area = (x2 - x1) * (y2 - y1)
+                        frame_area = img_rgb.shape[1] * img_rgb.shape[0]
+                        current_size_ratio = bbox_area / frame_area
 
                         # Extract ROI for classification
                         roi = img_rgb[y1:y2, x1:x2]
@@ -462,27 +766,79 @@ class VehicleTrackerApp:
                             classification_result = self.classify_vehicle(roi_tensor)
                             vehicle_class_name = classification_result.split(" (")[0]  # Extract just the class name
                             
+                            # Store vehicle info for both modes
+                            vehicle_info = {
+                                'id': idx,
+                                'bbox': (x1, y1, x2, y2),
+                                'center_norm': (x_center, y_center),
+                                'center_pixel': (x_center_pixel, y_center_pixel),
+                                'size_ratio': current_size_ratio,
+                                'class_name': vehicle_class_name,
+                                'classification_result': classification_result,
+                                'confidence': conf
+                            }
+                            detected_vehicles.append(vehicle_info)
+                            
                             # Run classification in a separate thread
                             thread = Thread(target=lambda: vehicle_positions.append(
-                                f"Vehicle {idx+1}: {classification_result} ({x_center_pixel:.0f}, {y_center_pixel:.0f})"
+                                f"Vehicle {idx+1}: {classification_result} ({x_center_pixel:.0f}, {y_center_pixel:.0f}) Size: {current_size_ratio:.3f}"
                             ))
                             threads.append(thread)
                             thread.start()
 
-                            if self.tracking_enabled and vehicle_class_name == self.selected_label.get(): 
-                                bbox_color = (0, 255, 0)  # Green for tracked vehicle
-                                vehicle_found = True
-                                self.vehicle_position.set(f"({x_center_pixel:.0f}, {y_center_pixel:.0f})")
-                                tracking_vehicle_x = x_center
-                                tracking_vehicle_y = y_center
-                            else:
-                                bbox_color = (255, 255, 255)  # Default white
-
-                            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), bbox_color, 2)
-
             # Wait for all classification threads to finish
             for thread in threads:
                 thread.join()
+
+            # Determine which vehicle to track based on mode
+            target_vehicle = None
+            
+            if self.tracking_enabled:
+                if self.tracking_mode.get() == "specific":
+                    # Original logic: track specific vehicle class
+                    selected_class = self.selected_label.get()
+                    for vehicle in detected_vehicles:
+                        if vehicle['class_name'] == selected_class:
+                            target_vehicle = vehicle
+                            break
+                elif self.tracking_mode.get() == "any":
+                    # New logic: track any vehicle (best available)
+                    target_vehicle = self.find_best_vehicle_to_track(detected_vehicles)
+                    if target_vehicle:
+                        self.tracked_vehicle_id = target_vehicle['id']
+
+            # Draw bounding boxes and handle tracking
+            for vehicle in detected_vehicles:
+                x1, y1, x2, y2 = vehicle['bbox']
+                
+                if target_vehicle and vehicle['id'] == target_vehicle['id']:
+                    bbox_color = (0, 255, 0)  # Green for tracked vehicle
+                    vehicle_found = True
+                    self.vehicle_position.set(f"({vehicle['center_pixel'][0]:.0f}, {vehicle['center_pixel'][1]:.0f})")
+                    tracking_vehicle_x = vehicle['center_norm'][0]
+                    tracking_vehicle_y = vehicle['center_norm'][1]
+                    tracking_bbox = vehicle['bbox']
+                    vehicle_size_ratio = vehicle['size_ratio']
+                    tracked_vehicle_class = vehicle['class_name']
+                    
+                    # Update vehicle size display
+                    percentage = vehicle_size_ratio * 100
+                    self.vehicle_size_var.set(f"{percentage:.1f}% of screen")
+                    
+                    # Update tracked vehicle info
+                    if self.tracking_mode.get() == "any":
+                        self.tracked_vehicle_info.set(f"{tracked_vehicle_class} (ID: {vehicle['id']})")
+                    else:
+                        self.tracked_vehicle_info.set(f"{tracked_vehicle_class}")
+                else:
+                    bbox_color = (255, 255, 255)  # Default white
+
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), bbox_color, 2)
+                
+                # Add vehicle ID for "any" mode
+                if self.tracking_mode.get() == "any":
+                    cv2.putText(annotated_frame, f"ID:{vehicle['id']}", (x1, y1-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, bbox_color, 1)
 
             # Display vehicle positions
             y_offset = annotated_frame.shape[0] - 40
@@ -493,19 +849,44 @@ class VehicleTrackerApp:
 
             # Handle tracking status
             is_tracking_lost = self.tracking_enabled and not vehicle_found
-            self.track_status.set("Tracking" if self.tracking_enabled and vehicle_found else
-                                "Lost" if is_tracking_lost else "Not Tracking")
-            if is_tracking_lost:
-                self.vehicle_position.set("N/A")
             
             if self.tracking_enabled and vehicle_found:
-                # Use normalized coordinates for PID control
+                if self.tracking_mode.get() == "any":
+                    self.track_status.set(f"Tracking Any Vehicle")
+                else:
+                    self.track_status.set(f"Tracking {tracked_vehicle_class}")
+            elif is_tracking_lost:
+                self.track_status.set("Lost")
+                self.tracked_vehicle_id = None  # Reset tracked vehicle ID
+            else:
+                self.track_status.set("Not Tracking")
+            
+            if is_tracking_lost or not self.tracking_enabled:
+                self.vehicle_position.set("N/A")
+                if hasattr(self, 'vehicle_size_var'):
+                    self.vehicle_size_var.set("N/A")
+                if hasattr(self, 'tracked_vehicle_info'):
+                    self.tracked_vehicle_info.set("N/A")
+            
+            if self.tracking_enabled and vehicle_found:
+                # Use enhanced PID with zoom control
                 new_time = time.time()
                 dt = new_time - old_time
-                PID(tracking_vehicle_x, tracking_vehicle_y, dt, vehicle_found)
-                print(f"Frame processing time: {dt:.3f}s")
+                frame_dims = (img_rgb.shape[1], img_rgb.shape[0])  # (width, height)
+                
+                # Use the new PID function with zoom
+                PID_with_zoom(tracking_vehicle_x, tracking_vehicle_y, tracking_bbox, frame_dims, dt, vehicle_found)
+                print(f"Frame processing time: {dt:.3f}s, Vehicle size: {vehicle_size_ratio:.3f}, Tracking: {tracked_vehicle_class}")
             else:
-                PID(0.0, 0.0, 0.0, False) # Reset PID when not tracking
+                # Use original PID for backward compatibility when not tracking
+                PID_with_zoom(0.0, 0.0, None, None, 0.0, False) # Reset PID when not tracking
+
+            # Add metadata overlay to top-left corner
+            self.add_metadata_overlay(annotated_frame)
+
+            # Add overlay frame to recorder - this is the key addition!
+            if self.overlay_recorder.is_recording:
+                self.overlay_recorder.add_frame(annotated_frame)
 
             # Convert frame for Tkinter display (resize to fit GUI)
             display_frame = cv2.resize(annotated_frame, (640, 360))  # Resize for display
@@ -523,8 +904,8 @@ class VehicleTrackerApp:
     def on_closing(self):
         print("Shutting down...")
         
-        if self.full_quality_recorder.is_recording:
-            self.full_quality_recorder.stop_recording()
+        if self.overlay_recorder.is_recording:
+            self.overlay_recorder.stop_recording()
         
         # Release camera
         if self.cap.isOpened():
