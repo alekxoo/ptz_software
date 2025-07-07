@@ -190,11 +190,9 @@ ptz_controller = PTZController()
 
 # Legacy function wrappers for compatibility with existing PID code
 def vel_x(velocity):
-    """Legacy wrapper for pan velocity control"""
     ptz_controller.vel_x(velocity)
 
 def vel_y(velocity):
-    """Legacy wrapper for tilt velocity control"""
     ptz_controller.vel_y(velocity)
 
 if __name__ == "__main__":

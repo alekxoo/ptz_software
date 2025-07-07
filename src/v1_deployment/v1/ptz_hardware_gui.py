@@ -192,7 +192,7 @@ class VehicleTrackerApp:
             "jpegdec ! videoscale ! "
             "video/x-raw,width=854,height=480,format=BGR ! "
             "videoconvert ! "
-            "appsink sync=false drop=true max-buffers=1")
+            "appsink sync=false drop=true max-buffers=1").format(session_timestamp=session_timestamp)
 
         self.cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
 
