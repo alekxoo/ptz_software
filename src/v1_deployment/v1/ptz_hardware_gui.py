@@ -19,6 +19,7 @@ import customtkinter as ctk
 import os
 import boto3
 from dotenv import load_dotenv
+import math 
 
 import socket
 import warnings
@@ -101,7 +102,6 @@ def parse_class_data(data):
 
     
 class VehicleTrackerApp:
-
     def __init__(self, root):
         self.root = root
         self.root.title("Vehicle Tracker")
@@ -131,6 +131,20 @@ class VehicleTrackerApp:
         self.pid_iy = tk.DoubleVar(value=0.1)    # Tilt integral
         self.pid_pz = tk.DoubleVar(value=2.0)    # Zoom proportional
         self.pid_iz = tk.DoubleVar(value=0.05)   # Zoom integral
+
+        self.debug_timing = {
+            'frame_time': 0.0,
+            'yolo_time': 0.0,
+            'class_time': 0.0,
+            'last_cmd_time': 0.0,
+            'vehicle_speed': 0.0,
+            'pid_error': 0.0,
+            'pan_rate': 0.0
+        }
+        
+        self.last_positions = []  # For vehicle speed tracking
+        self.last_pan_positions = []  # For pan rate tracking
+        self.frames_since_detection = 0
                 
         # Set up device
         cudnn.benchmark = True
@@ -163,14 +177,17 @@ class VehicleTrackerApp:
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
-        # Generate unique timestamp for this session
         session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
+
         gst = ("v4l2src device=/dev/video0 ! "
             "image/jpeg,width=3840,height=2160,framerate=30/1 ! "
             "jpegparse ! tee name=t "
-            "t. ! queue max-size-buffers=1 leaky=downstream ! "
-            f"avimux ! filesink location=full_quality_{session_timestamp}.avi "
+            
+            # Recording branch - heavily buffered, reliable, never drops frames
+            "t. ! queue max-size-buffers=120 leaky=upstream ! "
+            "avimux ! filesink location=full_quality_{session_timestamp}.avi sync=false async=true "
+            
+            # Processing branch - same as before, optimized for low latency
             "t. ! queue max-size-buffers=1 leaky=downstream ! "
             "jpegdec ! videoscale ! "
             "video/x-raw,width=854,height=480,format=BGR ! "
@@ -196,6 +213,84 @@ class VehicleTrackerApp:
         self.create_ui()
         self.update_frame()
         self.on_pid_change()
+
+    def calculate_vehicle_speed(self, center_x, center_y, frame_width):
+        """Calculate vehicle speed in pixels per second"""
+        current_time = time.time()
+        self.last_positions.append((center_x, center_y, current_time))
+        
+        # Keep only last 5 positions (for smoothing)
+        if len(self.last_positions) > 5:
+            self.last_positions.pop(0)
+        
+        if len(self.last_positions) >= 2:
+            pos1 = self.last_positions[-2]  # Previous position
+            pos2 = self.last_positions[-1]  # Current position
+            
+            dt = pos2[2] - pos1[2]
+            if dt > 0:
+                dx = (pos2[0] - pos1[0]) * frame_width  # Convert to pixels
+                dy = (pos2[1] - pos1[1]) * frame_width  # Assume square pixels
+                
+                velocity_pixels_per_sec = math.sqrt(dx*dx + dy*dy) / dt
+                return velocity_pixels_per_sec
+        
+        return 0.0
+
+    def calculate_pan_rate(self):
+        """Calculate camera pan rate in units per second"""
+        current_time = time.time()
+        current_pan = ptz_controller.current_pan
+        self.last_pan_positions.append((current_pan, current_time))
+        
+        # Keep only last 3 positions
+        if len(self.last_pan_positions) > 3:
+            self.last_pan_positions.pop(0)
+        
+        if len(self.last_pan_positions) >= 2:
+            pos1 = self.last_pan_positions[-2]
+            pos2 = self.last_pan_positions[-1]
+            
+            dt = pos2[1] - pos1[1]
+            if dt > 0:
+                dpan = abs(pos2[0] - pos1[0])
+                return dpan / dt
+        
+        return 0.0
+
+    def add_debug_overlay(self, frame):
+        """Add comprehensive debug information to frame matching left side style"""
+        debug_lines = [
+            f"Frame: {self.debug_timing['frame_time']:.1f}ms ({1000/max(self.debug_timing['frame_time'], 1):.1f}FPS)",
+            f"YOLO: {self.debug_timing['yolo_time']:.1f}ms",
+            f"Class: {self.debug_timing['class_time']:.1f}ms", 
+            f"PTZ Cmd: {self.debug_timing['last_cmd_time']:.1f}ms",
+            f"Vehicle Speed: {self.debug_timing['vehicle_speed']:.0f} px/s",
+            f"PID Error: {self.debug_timing['pid_error']:.3f}",
+            f"Pan Rate: {self.debug_timing['pan_rate']:.0f} units/s",
+            f"Lost Frames: {self.frames_since_detection}"
+        ]
+        
+        # Background dimensions to match left side
+        debug_width = 320
+        debug_height = len(debug_lines) * 20 + 10
+        start_x = frame.shape[1] - debug_width
+        
+        # Semi-transparent background matching left side
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (start_x, 0), (frame.shape[1], debug_height), (0, 0, 0), -1)
+        alpha = 0.7
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        
+        # Text styling to match left side exactly
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5  # Same as left side
+        color = (255, 255, 255)  # White text like left side
+        thickness = 1  # Thinner text like left side
+        
+        for i, line in enumerate(debug_lines):
+            y_pos = 20 + i* 20  # Match left side spacing
+            cv2.putText(frame, line, (start_x + 5, y_pos), font, font_scale, color, thickness)
 
     def on_pid_change(self, *args):
         """Handle PID gain changes"""
@@ -715,8 +810,28 @@ class VehicleTrackerApp:
 
             return f"{predicted_class_name} ({max_logit:.2f}, entropy: {entropy:.2f})"
 
+    def find_best_vehicle_to_track(self, detected_vehicles):
+        """
+        Simple tracking for any vehicle mode - pick largest vehicle
+        """
+        if not detected_vehicles:
+            return None
+            
+        # For "any" mode, just pick the largest/most confident vehicle
+        if self.tracking_mode.get() == "any":
+            return max(detected_vehicles, key=lambda v: v['size_ratio'] * v['confidence'])
+        
+        # For "specific" mode, use original logic
+        selected_class = self.selected_label.get()
+        for vehicle in detected_vehicles:
+            if vehicle['class_name'] == selected_class:
+                return vehicle
+        return None
+
     def update_frame(self):
         try:
+            frame_start_time = time.time()
+            
             with self.lock:
                 ret, img = self.cap.read()
             if not ret:
@@ -724,16 +839,17 @@ class VehicleTrackerApp:
                 self.root.after(100, self.update_frame)
                 return
             
-            old_time = time.time()
-            
-            # Scale down for inference to 480p
+            # YOLO inference timing
+            yolo_start = time.time()
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             results = self.yolov9_model.predict(img_rgb, classes=[2], verbose=False, imgsz=480)
+            self.debug_timing['yolo_time'] = (time.time() - yolo_start) * 1000
+            
             annotated_frame = img_rgb.copy()
             vehicle_found = False
             vehicle_positions = []
             threads = []
-            detected_vehicles = []  # Store all detected vehicles for "any" mode
+            detected_vehicles = []
 
             tracking_vehicle_x = 0.0
             tracking_vehicle_y = 0.0
@@ -741,7 +857,15 @@ class VehicleTrackerApp:
             vehicle_size_ratio = 0.0
             tracked_vehicle_class = ""
             
+            # Classification timing
+            classification_start = time.time()
+            
             if hasattr(results[0], 'boxes') and len(results[0].boxes) > 0:
+                detected_vehicles = []
+                
+                # Check if we need classification (only for "specific" mode)
+                need_classification = (self.tracking_mode.get() == "specific")
+                
                 for idx, box in enumerate(results[0].boxes):
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     conf = box.conf[0].item()
@@ -755,54 +879,61 @@ class VehicleTrackerApp:
                         frame_area = img_rgb.shape[1] * img_rgb.shape[0]
                         current_size_ratio = bbox_area / frame_area
 
-                        # Extract ROI for classification
-                        roi = img_rgb[y1:y2, x1:x2]
+                        # Only classify if in "specific" mode
+                        if need_classification:
+                            # Extract ROI for classification
+                            roi = img_rgb[y1:y2, x1:x2]
+                            if roi.size > 0:
+                                roi_pil = Image.fromarray(roi)
+                                roi_tensor = self.transform(roi_pil).unsqueeze(0).to(self.device)
+                                classification_result = self.classify_vehicle(roi_tensor)
+                                vehicle_class_name = classification_result.split(" (")[0]
+                            else:
+                                classification_result = "Unknown"
+                                vehicle_class_name = "Unknown"
+                        else:
+                            # Skip classification for "any" mode
+                            classification_result = f"Vehicle (conf: {conf:.2f})"
+                            vehicle_class_name = "Vehicle"
 
-                        if roi.size > 0:
-                            roi_pil = Image.fromarray(roi)
-                            roi_tensor = self.transform(roi_pil).unsqueeze(0).to(self.device)
+                        # Store vehicle info
+                        vehicle_info = {
+                            'id': idx,
+                            'bbox': (x1, y1, x2, y2),
+                            'center_norm': (x_center, y_center),
+                            'center_pixel': (x_center_pixel, y_center_pixel),
+                            'size_ratio': current_size_ratio,
+                            'class_name': vehicle_class_name,
+                            'classification_result': classification_result,
+                            'confidence': conf
+                        }
+                        detected_vehicles.append(vehicle_info)
 
-                            # Get classification result synchronously
-                            classification_result = self.classify_vehicle(roi_tensor)
-                            vehicle_class_name = classification_result.split(" (")[0]  # Extract just the class name
-                            
-                            # Store vehicle info for both modes
-                            vehicle_info = {
-                                'id': idx,
-                                'bbox': (x1, y1, x2, y2),
-                                'center_norm': (x_center, y_center),
-                                'center_pixel': (x_center_pixel, y_center_pixel),
-                                'size_ratio': current_size_ratio,
-                                'class_name': vehicle_class_name,
-                                'classification_result': classification_result,
-                                'confidence': conf
-                            }
-                            detected_vehicles.append(vehicle_info)
-                            
-                            # Run classification in a separate thread
-                            thread = Thread(target=lambda: vehicle_positions.append(
-                                f"Vehicle {idx+1}: {classification_result} ({x_center_pixel:.0f}, {y_center_pixel:.0f}) Size: {current_size_ratio:.3f}"
-                            ))
-                            threads.append(thread)
-                            thread.start()
+                        
+                        # Run classification in a separate thread
+                        thread = Thread(target=lambda: vehicle_positions.append(
+                            f"Vehicle {idx+1}: {classification_result} ({x_center_pixel:.0f}, {y_center_pixel:.0f}) Size: {current_size_ratio:.3f}"
+                        ))
+                        threads.append(thread)
+                        thread.start()
 
             # Wait for all classification threads to finish
             for thread in threads:
                 thread.join()
+                
+            self.debug_timing['class_time'] = (time.time() - classification_start) * 1000
 
             # Determine which vehicle to track based on mode
             target_vehicle = None
             
             if self.tracking_enabled:
                 if self.tracking_mode.get() == "specific":
-                    # Original logic: track specific vehicle class
                     selected_class = self.selected_label.get()
                     for vehicle in detected_vehicles:
                         if vehicle['class_name'] == selected_class:
                             target_vehicle = vehicle
                             break
                 elif self.tracking_mode.get() == "any":
-                    # New logic: track any vehicle (best available)
                     target_vehicle = self.find_best_vehicle_to_track(detected_vehicles)
                     if target_vehicle:
                         self.tracked_vehicle_id = target_vehicle['id']
@@ -820,6 +951,10 @@ class VehicleTrackerApp:
                     tracking_bbox = vehicle['bbox']
                     vehicle_size_ratio = vehicle['size_ratio']
                     tracked_vehicle_class = vehicle['class_name']
+                    
+                    # Calculate vehicle speed
+                    self.debug_timing['vehicle_speed'] = self.calculate_vehicle_speed(
+                        vehicle['center_norm'][0], vehicle['center_norm'][1], img_rgb.shape[1])
                     
                     # Update vehicle size display
                     percentage = vehicle_size_ratio * 100
@@ -847,7 +982,12 @@ class VehicleTrackerApp:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 y_offset -= 30
 
-            # Handle tracking status
+            # Handle tracking status and frame counting
+            if vehicle_found:
+                self.frames_since_detection = 0
+            else:
+                self.frames_since_detection += 1
+
             is_tracking_lost = self.tracking_enabled and not vehicle_found
             
             if self.tracking_enabled and vehicle_found:
@@ -857,7 +997,7 @@ class VehicleTrackerApp:
                     self.track_status.set(f"Tracking {tracked_vehicle_class}")
             elif is_tracking_lost:
                 self.track_status.set("Lost")
-                self.tracked_vehicle_id = None  # Reset tracked vehicle ID
+                self.tracked_vehicle_id = None
             else:
                 self.track_status.set("Not Tracking")
             
@@ -868,28 +1008,46 @@ class VehicleTrackerApp:
                 if hasattr(self, 'tracked_vehicle_info'):
                     self.tracked_vehicle_info.set("N/A")
             
+            # PID Control with timing
+            pid_start = time.time()
             if self.tracking_enabled and vehicle_found:
+                # Calculate PID error for debug
+                x_error = tracking_vehicle_x - 0.5
+                y_error = tracking_vehicle_y - 0.5
+                self.debug_timing['pid_error'] = math.sqrt(x_error*x_error + y_error*y_error)
+                
                 # Use enhanced PID with zoom control
                 new_time = time.time()
-                dt = new_time - old_time
-                frame_dims = (img_rgb.shape[1], img_rgb.shape[0])  # (width, height)
+                dt = new_time - frame_start_time
+                frame_dims = (img_rgb.shape[1], img_rgb.shape[0])
                 
-                # Use the new PID function with zoom
                 PID_with_zoom(tracking_vehicle_x, tracking_vehicle_y, tracking_bbox, frame_dims, dt, vehicle_found)
-                print(f"Frame processing time: {dt:.3f}s, Vehicle size: {vehicle_size_ratio:.3f}, Tracking: {tracked_vehicle_class}")
             else:
-                # Use original PID for backward compatibility when not tracking
-                PID_with_zoom(0.0, 0.0, None, None, 0.0, False) # Reset PID when not tracking
+                self.debug_timing['pid_error'] = 0.0
+                PID_with_zoom(0.0, 0.0, None, None, 0.0, False)
+            
+            # Calculate pan rate
+            self.debug_timing['pan_rate'] = self.calculate_pan_rate()
+            
+            # Get PTZ command timing
+            if hasattr(ptz_controller, 'last_cmd_time'):
+                self.debug_timing['last_cmd_time'] = ptz_controller.last_cmd_time
 
             # Add metadata overlay to top-left corner
             self.add_metadata_overlay(annotated_frame)
+            
+            # Add debug overlay to top-right corner
+            self.add_debug_overlay(annotated_frame)
 
-            # Add overlay frame to recorder - this is the key addition!
+            # Add overlay frame to recorder
             if self.overlay_recorder.is_recording:
                 self.overlay_recorder.add_frame(annotated_frame)
 
-            # Convert frame for Tkinter display (resize to fit GUI)
-            display_frame = cv2.resize(annotated_frame, (640, 360))  # Resize for display
+            # Calculate total frame time
+            self.debug_timing['frame_time'] = (time.time() - frame_start_time) * 1000
+
+            # Convert frame for Tkinter display
+            display_frame = cv2.resize(annotated_frame, (640, 360))
             frame_pil = Image.fromarray(display_frame)
             frame_tk = ImageTk.PhotoImage(frame_pil)
             self.video_label.configure(image=frame_tk)
@@ -900,6 +1058,7 @@ class VehicleTrackerApp:
 
         # Schedule next update
         self.root.after(30, self.update_frame)
+
 
     def on_closing(self):
         print("Shutting down...")

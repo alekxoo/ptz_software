@@ -38,6 +38,7 @@ class PTZController:
         # Lock for thread safety
         self.lock = threading.Lock()
         
+        self.last_cmd_time = 0.0  # Add this line
         # Initialize camera to home position
         self.initialize_camera()
     
@@ -46,10 +47,12 @@ class PTZController:
         return max(min_val, min(max_val, int(value)))
     
     def send_v4l2_command(self, control, value):
-        """Send v4l2-ctl command to camera"""
         try:
+            cmd_start = time.time()
             args = ["v4l2-ctl", f"--set-ctrl={control}={value}"]
-            result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+            result = subprocess.run(args, capture_output=True, text=True, timeout=1)
+            self.last_cmd_time = (time.time() - cmd_start) * 1000  # Store timing
+            
             if result.returncode != 0:
                 print(f"v4l2-ctl error: {result.stderr}")
                 return False
@@ -60,7 +63,7 @@ class PTZController:
         except Exception as e:
             print(f"v4l2-ctl exception: {e}")
             return False
-    
+        
     def initialize_camera(self):
         """Initialize camera to home position on startup"""
         print("Initializing PTZ camera to home position...")
@@ -80,6 +83,7 @@ class PTZController:
         with self.lock:
             clamped_value = self.clamp_value(value, self.PAN_MIN, self.PAN_MAX)
             if self.send_v4l2_command("pan_absolute", clamped_value):
+                time.sleep(0.01)
                 self.current_pan = clamped_value
                 return True
             return False
@@ -89,6 +93,7 @@ class PTZController:
         with self.lock:
             clamped_value = self.clamp_value(value, self.TILT_MIN, self.TILT_MAX)
             if self.send_v4l2_command("tilt_absolute", clamped_value):
+                time.sleep(0.01)
                 self.current_tilt = clamped_value
                 return True
             return False
@@ -98,6 +103,7 @@ class PTZController:
         with self.lock:
             clamped_value = self.clamp_value(value, self.ZOOM_MIN, self.ZOOM_MAX)
             if self.send_v4l2_command("zoom_absolute", clamped_value):
+                time.sleep(0.01)
                 self.current_zoom = clamped_value
                 return True
             return False
@@ -114,7 +120,7 @@ class PTZController:
         thread = threading.Thread(target=move_pan)
         thread.daemon = True
         thread.start()
-    
+            
     def vel_y(self, velocity):
         """Tilt velocity control (replaces ServoControl.vel_y)"""
         def move_tilt():

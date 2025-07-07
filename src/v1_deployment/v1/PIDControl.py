@@ -158,7 +158,7 @@ def PID_with_zoom(x_norm, y_norm, bbox_coords, frame_dims, delta_time, detection
         if ZOOM_ENABLED and abs(z_error) > DEADBAND_Z:
             current_zoom = ptz_controller.current_zoom
             # Convert zoom velocity to position change
-            zoom_change = int(zoom_output * 50)  # Adjust multiplier as needed
+            zoom_change = int(zoom_output * 10)  # Adjust multiplier as needed
             new_zoom = current_zoom + zoom_change
             ptz_controller.set_zoom_absolute(new_zoom)
         
