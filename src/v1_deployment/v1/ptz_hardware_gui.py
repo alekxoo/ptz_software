@@ -138,6 +138,8 @@ class VehicleTrackerApp:
             'class_time': 0.0,
             'last_cmd_time': 0.0,
             'vehicle_speed': 0.0,
+            'pid_x_error': 0.0,
+            'pid_y_error': 0.0,
             'pid_error': 0.0,
             'pan_rate': 0.0
         }
@@ -266,6 +268,8 @@ class VehicleTrackerApp:
             f"Class: {self.debug_timing['class_time']:.1f}ms", 
             f"PTZ Cmd: {self.debug_timing['last_cmd_time']:.1f}ms",
             f"Vehicle Speed: {self.debug_timing['vehicle_speed']:.0f} px/s",
+            f"PID X Error: {self.debug_timing['pid_x_error']:.3f}",
+            f"PID Y Error: {self.debug_timing['pid_y_error']:.3f}",
             f"PID Error: {self.debug_timing['pid_error']:.3f}",
             f"Pan Rate: {self.debug_timing['pan_rate']:.0f} units/s",
             f"Lost Frames: {self.frames_since_detection}"
@@ -1014,6 +1018,8 @@ class VehicleTrackerApp:
                 # Calculate PID error for debug
                 x_error = tracking_vehicle_x - 0.5
                 y_error = tracking_vehicle_y - 0.5
+                self.debug_timing['pid_x_error'] = x_error
+                self.debug_timing['pid_y_error'] = y_error
                 self.debug_timing['pid_error'] = math.sqrt(x_error*x_error + y_error*y_error)
                 
                 # Use enhanced PID with zoom control
@@ -1023,6 +1029,8 @@ class VehicleTrackerApp:
                 
                 PID_with_zoom(tracking_vehicle_x, tracking_vehicle_y, tracking_bbox, frame_dims, dt, vehicle_found)
             else:
+                self.debug_timing['pid_x_error'] = 0.0
+                self.debug_timing['pid_y_error'] = 0.0
                 self.debug_timing['pid_error'] = 0.0
                 PID_with_zoom(0.0, 0.0, None, None, 0.0, False)
             
@@ -1073,8 +1081,7 @@ class VehicleTrackerApp:
 
         # Close the app window
         self.root.destroy()
-
-
+        
 def main():
     root = tk.Tk()
     app = VehicleTrackerApp(root)

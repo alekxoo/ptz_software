@@ -111,8 +111,6 @@ class PTZController:
     def vel_x(self, velocity):
         """Pan velocity control (replaces StepperControl.vel_x)"""
         def move_pan():
-            # Convert velocity to position change
-            # Adjust multiplier based on your desired responsiveness
             position_change = velocity * 1000  # Adjust this multiplier as needed
             new_pan = self.current_pan + position_change
             self.set_pan_absolute(new_pan)
