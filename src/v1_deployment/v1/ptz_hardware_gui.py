@@ -104,7 +104,7 @@ def parse_class_data(data):
 class VehicleTrackerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Vehicle Tracker")
+        self.root.title("Vehicle Tracker - VISCA")  # Change from "Vehicle Tracker"
         self.current_mode = tk.StringVar(value="ptz")
 
         #create a thread locker for recording
@@ -116,7 +116,11 @@ class VehicleTrackerApp:
 
         # Bind keyboard events for PTZ control
         self.root.bind('<KeyPress>', self.on_key_press)
+        self.root.bind('<KeyRelease>', self.on_key_release)
         self.root.focus_set()  # Ensure window can receive keyboard events
+
+        self.keys_currently_down = set()
+        self.last_key_state = set()
 
         self.zoom_enabled = tk.BooleanVar(value=True)
         self.target_vehicle_size = tk.DoubleVar(value=0.2)  # Default to 1/5 screen
@@ -129,9 +133,8 @@ class VehicleTrackerApp:
         self.pid_ix = tk.DoubleVar(value=0.2)    # Pan integral
         self.pid_py = tk.DoubleVar(value=-15.0)  # Tilt proportional  
         self.pid_iy = tk.DoubleVar(value=0.1)    # Tilt integral
-        self.pid_pz = tk.DoubleVar(value=2.0)    # Zoom proportional
-        self.pid_iz = tk.DoubleVar(value=0.05)   # Zoom integral
-
+        self.pid_pz = tk.DoubleVar(value=3.0)    # Zoom proportional (higher for VISCA)
+        self.pid_iz = tk.DoubleVar(value=0.1)    # Zoom integral (higher for VISCA)
         self.debug_timing = {
             'frame_time': 0.0,
             'yolo_time': 0.0,
@@ -157,7 +160,7 @@ class VehicleTrackerApp:
         self.yolov9_model = YOLO("./yoloModels/yolov9s.pt").to(self.device)
 
         # Load configuration and models
-        yaml_data = load_yaml("/home/machvision/Documents/ptz_software/src/ml/object_detection/config/config_a8621af6.yaml")
+        yaml_data = load_yaml("/home/machvision/Documents/ptz_software/src/ml/object_detection/config/config_998f13b1.yaml")
         self.class_labels, num_classes = parse_class_data(yaml_data)
 
         model_classification_start_time = time.time()
@@ -215,6 +218,8 @@ class VehicleTrackerApp:
         self.create_ui()
         self.update_frame()
         self.on_pid_change()
+        self.check_key_state()
+        self.update_camera_positions()  # Start position feedback
 
     def calculate_vehicle_speed(self, center_x, center_y, frame_width):
         """Calculate vehicle speed in pixels per second"""
@@ -266,17 +271,18 @@ class VehicleTrackerApp:
             f"Frame: {self.debug_timing['frame_time']:.1f}ms ({1000/max(self.debug_timing['frame_time'], 1):.1f}FPS)",
             f"YOLO: {self.debug_timing['yolo_time']:.1f}ms",
             f"Class: {self.debug_timing['class_time']:.1f}ms", 
-            f"PTZ Cmd: {self.debug_timing['last_cmd_time']:.1f}ms",
+            f"VISCA Cmd: {self.debug_timing['last_cmd_time']:.1f}ms",
             f"Vehicle Speed: {self.debug_timing['vehicle_speed']:.0f} px/s",
             f"PID X Error: {self.debug_timing['pid_x_error']:.3f}",
             f"PID Y Error: {self.debug_timing['pid_y_error']:.3f}",
             f"PID Error: {self.debug_timing['pid_error']:.3f}",
             f"Pan Rate: {self.debug_timing['pan_rate']:.0f} units/s",
-            f"Lost Frames: {self.frames_since_detection}"
+            f"Lost Frames: {self.frames_since_detection}",
+            f"VISCA States: P={ptz_controller.pan_state} T={ptz_controller.tilt_state} Z={ptz_controller.zoom_state}"
         ]
         
         # Background dimensions to match left side
-        debug_width = 320
+        debug_width = 350  # Slightly wider for VISCA state info
         debug_height = len(debug_lines) * 20 + 10
         start_x = frame.shape[1] - debug_width
         
@@ -295,7 +301,7 @@ class VehicleTrackerApp:
         for i, line in enumerate(debug_lines):
             y_pos = 20 + i* 20  # Match left side spacing
             cv2.putText(frame, line, (start_x + 5, y_pos), font, font_scale, color, thickness)
-
+            
     def on_pid_change(self, *args):
         """Handle PID gain changes"""
         from PIDControl import set_pid_gains
@@ -309,41 +315,80 @@ class VehicleTrackerApp:
         )
 
     def reset_pid_defaults(self):
-        """Reset PID gains to default values"""
-        self.pid_px.set(15.0)
-        self.pid_ix.set(0.2)
-        self.pid_py.set(-15.0)
-        self.pid_iy.set(0.1)
-        self.pid_pz.set(2.0)
-        self.pid_iz.set(0.05)
+        """Reset PID gains to default values for VISCA"""
+        self.pid_px.set(0.1)
+        self.pid_ix.set(0)
+        self.pid_py.set(-0.1)
+        self.pid_iy.set(0)
+        self.pid_pz.set(1.0)   # Higher for VISCA discrete zoom
+        self.pid_iz.set(0.1)   # Higher for VISCA discrete zoom
         self.on_pid_change()
 
     def on_key_press(self, event):
-        """Handle keyboard input for PTZ control"""
+        """Handle keyboard input for smooth VISCA PTZ control"""
         key = event.keysym
         
-        if key == 'Right':
-            ptz_controller.manual_pan_right()
-            print("Pan Right")
-        elif key == 'Left':
-            ptz_controller.manual_pan_left()
-            print("Pan Left")
-        elif key == 'Up':
-            ptz_controller.manual_tilt_up()
-            print("Tilt Up")
-        elif key == 'Down':
-            ptz_controller.manual_tilt_down()
-            print("Tilt Down")
-        elif key == 'Prior':  # Page Up
-            ptz_controller.manual_zoom_in()
-            print("Zoom In")
-        elif key == 'Next':   # Page Down
-            ptz_controller.manual_zoom_out()
-            print("Zoom Out")
+        # Handle special keys immediately
+        if key == 'space':
+            ptz_controller.stop_all_movement()
+            self.keys_currently_down.clear()
+            print("All movement stopped")
+            return
         elif key == 'Escape':
             ptz_controller.go_home()
+            self.keys_currently_down.clear()
             print("PTZ Home")
+            return
+        
+        # For movement keys, add to set for continuous control
+        if key in ['Left', 'Right', 'Up', 'Down', 'Prior', 'Next']:
+            self.keys_currently_down.add(key)
+    
+    def on_key_release(self, event):
+        """Handle key release for smooth VISCA control"""
+        key = event.keysym
+        
+        # Remove key from currently pressed set
+        self.keys_currently_down.discard(key)
 
+    def check_key_state(self):
+        """Monitor key state changes for smooth VISCA control"""
+        current_state = self.keys_currently_down.copy()
+        
+        # Only update if key state actually changed
+        if current_state != self.last_key_state:
+            self.last_key_state = current_state
+            self.update_visca_movement(current_state)
+        
+        # Schedule next check
+        self.root.after(20, self.check_key_state)  # 50Hz polling
+
+    def update_visca_movement(self, pressed_keys):
+        """Update VISCA camera movement based on currently pressed keys"""
+        # Calculate pan state
+        pan_state = 0
+        if 'Left' in pressed_keys:
+            pan_state = -1
+        elif 'Right' in pressed_keys:
+            pan_state = 1
+        
+        # Calculate tilt state
+        tilt_state = 0
+        if 'Up' in pressed_keys:
+            tilt_state = 1
+        elif 'Down' in pressed_keys:
+            tilt_state = -1
+        
+        # Calculate zoom state
+        zoom_state = 0
+        if 'Prior' in pressed_keys:  # Page Up
+            zoom_state = 1  # Zoom in
+        elif 'Next' in pressed_keys:  # Page Down
+            zoom_state = -1  # Zoom out
+        
+        # Update camera movement (only sends command if state changed)
+        ptz_controller.update_continuous_movement(pan_state, tilt_state, zoom_state)
+            
     def create_ui(self):
         # Main container
         main_container = ctk.CTkFrame(self.root)
@@ -489,7 +534,7 @@ class VehicleTrackerApp:
             ctk.CTkLabel(pan_pid_frame, text="Pan:", font=("Arial", 11, "bold"), width=50).pack(side="left")
 
             ctk.CTkLabel(pan_pid_frame, text="P:", width=20).pack(side="left", padx=(10,0))
-            px_slider = ctk.CTkSlider(pan_pid_frame, from_=0.1, to=30.0, number_of_steps=299,
+            px_slider = ctk.CTkSlider(pan_pid_frame, from_=0.1, to=3.0, number_of_steps=299,
                                     variable=self.pid_px, command=lambda x: self.on_pid_change(), width=80)
             px_slider.pack(side="left", padx=2)
             px_label = ctk.CTkLabel(pan_pid_frame, text=f"{self.pid_px.get():.1f}", width=30)
@@ -510,7 +555,7 @@ class VehicleTrackerApp:
             ctk.CTkLabel(tilt_pid_frame, text="Tilt:", font=("Arial", 11, "bold"), width=50).pack(side="left")
 
             ctk.CTkLabel(tilt_pid_frame, text="P:", width=20).pack(side="left", padx=(10,0))
-            py_slider = ctk.CTkSlider(tilt_pid_frame, from_=-30.0, to=30.0, number_of_steps=600,
+            py_slider = ctk.CTkSlider(tilt_pid_frame, from_=-3.0, to=0, number_of_steps=600,
                                     variable=self.pid_py, command=lambda x: self.on_pid_change(), width=80)
             py_slider.pack(side="left", padx=2)
             py_label = ctk.CTkLabel(tilt_pid_frame, text=f"{self.pid_py.get():.1f}", width=30)
@@ -531,7 +576,7 @@ class VehicleTrackerApp:
             ctk.CTkLabel(zoom_pid_frame, text="Zoom:", font=("Arial", 11, "bold"), width=50).pack(side="left")
 
             ctk.CTkLabel(zoom_pid_frame, text="P:", width=20).pack(side="left", padx=(10,0))
-            pz_slider = ctk.CTkSlider(zoom_pid_frame, from_=0.1, to=10.0, number_of_steps=99,
+            pz_slider = ctk.CTkSlider(zoom_pid_frame, from_=0.1, to=3.0, number_of_steps=99,
                                     variable=self.pid_pz, command=lambda x: self.on_pid_change(), width=80)
             pz_slider.pack(side="left", padx=2)
             pz_label = ctk.CTkLabel(zoom_pid_frame, text=f"{self.pid_pz.get():.1f}", width=30)
@@ -773,7 +818,8 @@ class VehicleTrackerApp:
             f"PID I: {self.pid_ix.get():.2f}, {self.pid_iy.get():.2f}, {self.pid_iz.get():.2f}",
             f"Target Size: {self.target_vehicle_size.get():.2f}",
             f"Auto-Zoom: {'ON' if self.zoom_enabled.get() else 'OFF'}",
-            f"Mode: {self.tracking_mode.get().title()}"
+            f"Mode: {self.tracking_mode.get().title()}",
+            f"VISCA: {'Connected' if ptz_controller.connected else 'Disconnected'}"
         ]
         
         # Background rectangle dimensions
@@ -1067,12 +1113,25 @@ class VehicleTrackerApp:
         # Schedule next update
         self.root.after(30, self.update_frame)
 
+    def update_camera_positions(self):
+        """Periodically update camera positions from VISCA feedback"""
+        if ptz_controller.connected:
+            # Update positions from camera every 2 seconds (to avoid overwhelming the camera)
+            ptz_controller.update_position_from_camera()
+        
+        # Schedule next update
+        self.root.after(2000, self.update_camera_positions)
+
 
     def on_closing(self):
-        print("Shutting down...")
+        print("Shutting down VISCA PTZ system...")
         
         if self.overlay_recorder.is_recording:
             self.overlay_recorder.stop_recording()
+        
+        # Stop all camera movement and disconnect
+        ptz_controller.stop_all_movement()
+        ptz_controller.disconnect()
         
         # Release camera
         if self.cap.isOpened():
@@ -1081,7 +1140,7 @@ class VehicleTrackerApp:
 
         # Close the app window
         self.root.destroy()
-        
+            
 def main():
     root = tk.Tk()
     app = VehicleTrackerApp(root)

@@ -1,19 +1,19 @@
-#PID control library for PTZ Camera with Autonomous Zoom
+#PID control library for PTZ Camera with Autonomous Zoom - VISCA Version
 #Written by: Abdullah Alwakeel
-#Updated for PTZ Camera with Zoom Control: July 2025
+#Updated for VISCA Camera Control: July 2025
 
 from PTZControl import vel_x, vel_y, ptz_controller
-
+import time  # Add this line at the top with other imports
 # PID gains - adjust these based on your camera's responsiveness
-PX = 15.0    # Pan proportional gain
-IX = 0.2    # Pan integral gain
+PX = 1.0    # Pan proportional gain
+IX = 0    # Pan integral gain
 
-PY = -15.0   # Tilt proportional gain (negative because camera coordinates may be inverted)
-IY = 0.1    # Tilt integral gain
+PY = -1.0   # Tilt proportional gain (negative because camera coordinates may be inverted)
+IY = 0   # Tilt integral gain
 
-# Zoom PID gains
-PZ = 2.0    # Zoom proportional gain
-IZ = 0.05   # Zoom integral gain
+# Zoom PID gains (adjusted for VISCA discrete zoom control)
+PZ = 3.0    # Zoom proportional gain (higher since VISCA zoom is more discrete)
+IZ = 0    # Zoom integral gain
 
 i_x_acc = 0.0 # Accumulated integral error for pan
 i_y_acc = 0.0 # Accumulated integral error for tilt
@@ -22,15 +22,19 @@ i_z_acc = 0.0 # Accumulated integral error for zoom
 time_since_last_detection = 0 # Frames without detection
 
 # Deadband to prevent jittery movements when target is close to center
-DEADBAND_X = 0.02  # 2% deadband for pan
-DEADBAND_Y = 0.02  # 2% deadband for tilt
-DEADBAND_Z = 0.01  # 1% deadband for zoom
+DEADBAND_X = 0.03  # 2% deadband for pan
+DEADBAND_Y = 0.03  # 2% deadband for tilt  
+DEADBAND_Z = 0.03  # 3% deadband for zoom (larger since VISCA zoom is discrete)
 
 # Zoom control settings
 TARGET_VEHICLE_SIZE = 0.2  # Target: vehicle should occupy 20% of screen (1/5)
 MIN_VEHICLE_SIZE = 0.05    # Minimum size to start zooming in
 MAX_VEHICLE_SIZE = 0.4     # Maximum size to start zooming out
 ZOOM_ENABLED = True        # Enable/disable autonomous zoom
+
+# VISCA zoom timing control
+last_zoom_command_time = 0.0
+ZOOM_COMMAND_INTERVAL = 0.3  # Minimum time between zoom commands (seconds)
 
 def calculate_bbox_size_ratio(x1, y1, x2, y2, frame_width, frame_height):
     """
@@ -76,10 +80,12 @@ def PID_reset():
     i_z_acc = 0.0
     vel_x(0.0)  # Stop pan movement
     vel_y(0.0)  # Stop tilt movement
+    # Stop zoom movement
+    ptz_controller.update_continuous_movement(ptz_controller.pan_state, ptz_controller.tilt_state, 0)
 
 def PID_with_zoom(x_norm, y_norm, bbox_coords, frame_dims, delta_time, detection):
     """
-    Enhanced PID controller with autonomous zoom for PTZ camera tracking
+    Enhanced PID controller with autonomous zoom for VISCA PTZ camera tracking
     
     Args:
         x_norm: Normalized x position (0.0 to 1.0, where 0.5 is center)
@@ -89,7 +95,9 @@ def PID_with_zoom(x_norm, y_norm, bbox_coords, frame_dims, delta_time, detection
         delta_time: Time since last update (seconds)
         detection: Boolean indicating if target is detected
     """
-    global i_y_acc, i_x_acc, i_z_acc, time_since_last_detection
+    global i_y_acc, i_x_acc, i_z_acc, time_since_last_detection, last_zoom_command_time
+    
+    current_time = time.time()
     
     if not detection:
         time_since_last_detection += 1
@@ -146,26 +154,62 @@ def PID_with_zoom(x_norm, y_norm, bbox_coords, frame_dims, delta_time, detection
         zoom_output = PZ * z_error + IZ * i_z_acc
         
         # Clamp outputs to reasonable ranges
-        pan_output = max(-5.0, min(5.0, pan_output))
-        tilt_output = max(-5.0, min(5.0, tilt_output))
-        zoom_output = max(-2.0, min(2.0, zoom_output))
+        pan_output = max(-10.0, min(10.0, pan_output))
+        tilt_output = max(-10.0, min(10.0, tilt_output))
+        zoom_output = max(-5.0, min(5.0, zoom_output))
         
-        # Send velocity commands to PTZ controller
+        # Send velocity commands to PTZ controller for pan/tilt
         vel_x(pan_output)
         vel_y(tilt_output)
         
-        # Apply zoom control using absolute positioning
+        # Apply zoom control using VISCA discrete zoom commands
         if ZOOM_ENABLED and abs(z_error) > DEADBAND_Z:
-            current_zoom = ptz_controller.current_zoom
-            # Convert zoom velocity to position change
-            zoom_change = int(zoom_output * 10)  # Adjust multiplier as needed
-            new_zoom = current_zoom + zoom_change
-            ptz_controller.set_zoom_absolute(new_zoom)
+            # Rate limit zoom commands to prevent overwhelming the camera
+            if current_time - last_zoom_command_time >= ZOOM_COMMAND_INTERVAL:
+                # Determine zoom direction based on error magnitude
+                if zoom_output > 1.0:
+                    # Need to zoom in significantly
+                    ptz_controller.update_continuous_movement(
+                        ptz_controller.pan_state, 
+                        ptz_controller.tilt_state, 
+                        1  # Zoom tele
+                    )
+                    last_zoom_command_time = current_time
+                elif zoom_output < -1.0:
+                    # Need to zoom out significantly  
+                    ptz_controller.update_continuous_movement(
+                        ptz_controller.pan_state,
+                        ptz_controller.tilt_state,
+                        -1  # Zoom wide
+                    )
+                    last_zoom_command_time = current_time
+                else:
+                    # Error is small, stop zoom
+                    if ptz_controller.zoom_state != 0:
+                        ptz_controller.update_continuous_movement(
+                            ptz_controller.pan_state,
+                            ptz_controller.tilt_state,
+                            0  # Zoom stop
+                        )
+        else:
+            # Stop zoom if not needed
+            if ptz_controller.zoom_state != 0:
+                ptz_controller.update_continuous_movement(
+                    ptz_controller.pan_state,
+                    ptz_controller.tilt_state,
+                    0  # Zoom stop
+                )
         
         # Debug output
         if abs(x_error) > DEADBAND_X or abs(y_error) > DEADBAND_Y or abs(z_error) > DEADBAND_Z:
             print(f"PID: x_err={x_error:.3f}, y_err={y_error:.3f}, z_err={z_error:.3f}")
             print(f"     pan_out={pan_output:.3f}, tilt_out={tilt_output:.3f}, zoom_out={zoom_output:.3f}")
+            print(f"     zoom_state={ptz_controller.zoom_state}")
+            print(f"VEHICLE: position=({x_norm:.3f}, {y_norm:.3f})")
+            print(f"ERROR: raw=({x_norm-0.5:.3f}, {y_norm-0.5:.3f})")
+            print(f"ERROR: after_deadband=({x_error:.3f}, {y_error:.3f})")
+            print(f"OUTPUT: pid=({pan_output:.3f}, {tilt_output:.3f})")
+            print(f"THRESHOLDS: will_move=({abs(pan_output)>0.1}, {abs(tilt_output)>0.1})")
 
 # Backward compatibility wrapper
 def PID(x_norm, y_norm, delta_time, detection):
@@ -189,6 +233,14 @@ def set_zoom_enabled(enabled):
     global ZOOM_ENABLED
     ZOOM_ENABLED = enabled
     print(f"Autonomous zoom {'enabled' if enabled else 'disabled'}")
+    
+    # Stop zoom if disabling
+    if not enabled and ptz_controller.zoom_state != 0:
+        ptz_controller.update_continuous_movement(
+            ptz_controller.pan_state,
+            ptz_controller.tilt_state,
+            0  # Stop zoom
+        )
 
 def set_pid_gains(px=None, ix=None, py=None, iy=None, pz=None, iz=None):
     """
@@ -239,9 +291,22 @@ def set_deadband(x_deadband=None, y_deadband=None, z_deadband=None):
     
     print(f"Deadband updated: X={DEADBAND_X}, Y={DEADBAND_Y}, Z={DEADBAND_Z}")
 
+def set_zoom_timing(command_interval=None):
+    """
+    Update zoom command timing
+    
+    Args:
+        command_interval: Minimum time between zoom commands (seconds)
+    """
+    global ZOOM_COMMAND_INTERVAL
+    
+    if command_interval is not None:
+        ZOOM_COMMAND_INTERVAL = max(0.1, min(2.0, command_interval))
+        print(f"Zoom command interval set to {ZOOM_COMMAND_INTERVAL:.1f} seconds")
+
 if __name__ == "__main__":
-    # Test the enhanced PID controller
-    print("Enhanced PID Controller Test with Zoom")
+    # Test the enhanced PID controller with VISCA
+    print("Enhanced PID Controller Test with VISCA Zoom")
     print("Testing different vehicle sizes and zoom responses")
     
     import time
@@ -274,6 +339,6 @@ if __name__ == "__main__":
         # Test for a few iterations
         for i in range(5):
             PID_with_zoom(0.5, 0.5, bbox_coords, frame_dims, 0.033, True)
-            time.sleep(0.1)
+            time.sleep(0.4)  # Wait for zoom command interval
     
-    print("\nPID zoom test complete")
+    print("\nPID VISCA zoom test complete")

@@ -1,0 +1,10 @@
+classes:
+- id: 1
+  label: 1_BMW_Gray_Aaditiya
+- id: 2
+  label: 2_BMW_Gray_Asher
+- id: 3
+  label: 3_Tesla_Gray_Jack
+num_classes: 3
+user:
+  full_name: Alex Koo
