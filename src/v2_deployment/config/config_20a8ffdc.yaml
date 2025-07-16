@@ -1,0 +1,8 @@
+classes:
+- id: 1
+  label: Cybertruck
+- id: 2
+  label: Model S
+num_classes: 2
+user:
+  full_name: testuser
