@@ -3,42 +3,47 @@ from datetime import datetime
 from pydantic import BaseModel
 from pymongo import MongoClient
 from dotenv import load_dotenv
+import requests
 import os
 
 load_dotenv()
 
 app = FastAPI()
 
+CAMERA_IP = os.getenv("Blu_B160v")  # Tailscale or local IP
 MONGO_URI = os.getenv("MongoDB_URI")
 MONGO_DB = os.getenv("MongoDB_DB", "monitoring_system")
 
-client = MongoClient(MONGO_URI)
-db = client[MONGO_DB]
-status_collection = db["phone_status"]
+# Fetch sensor data from the IP Webcam server
+try:
+    response = requests.get(f"{CAMERA_IP}/sensors.json?sense=battery_charging,battery_level,battery_temp")
+    data = response.json()
+    battery_charging = data.get("battery_charging", {}).get("unit", [[None, [None]]])
+    battery_level = data.get("battery_level", {}).get("data", [[None, [None]]])[0][1][0]
+    battery_temp = data.get("battery_temp", {}).get("data", [[None, [None]]])[0][1][0]
 
 
-class PhoneStatus(BaseModel):
-    device_id: str
-    timestamp: datetime
-    battery_percentage: int
-    is_charging: bool
-    battery_temperature: float
-    recording: bool
-    storage_used: int
-    signal: int
-    network_type: str
+    doc = {
+        "device_id": "Blu_B160v",
+        "timestamp": datetime.now().isoformat(),
+        "battery_charging": battery_charging,
+        "battery_percentage": battery_level,
+        "battery_temperature": battery_temp,
+    }
 
+    print("Parsed data:", doc)
 
-@app.post("/status")
-async def log_status(status: PhoneStatus):
-    status_dict = status.dict()
-    status_collection.insert_one(status_dict)
-    print(f"[{status.timestamp}] Status logged for device {status.device_id}")
-    return {"message": "Status logged successfully", "device_id": status.device_id}
+except Exception as e:
+    print("Failed to fetch sensor data:", e)
+    exit()
 
+# Insert the document into MongoDB
+try:
+    client = MongoClient(MONGO_URI)
+    db = client[MONGO_DB]
+    status_collection = db["phone_status"]
+    result = status_collection.insert_one(doc)
+    print("Inserted into MongoDB:", result.inserted_id)
 
-@app.get("/status/logs")
-async def get_logs():
-    logs = list(status_collection.find({}, {"_id": 0}))
-    print(f"Retrieved {len(logs)} logs from the database")
-    return {"logs": logs}
+except Exception as e:
+    print("Failed to insert into MongoDB:", e)
