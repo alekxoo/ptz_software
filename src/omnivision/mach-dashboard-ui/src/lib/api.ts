@@ -1,19 +1,18 @@
 import axios from 'axios'
-
-const API_BASE = import.meta.env.API_BASE || 'http://localhost:8000'
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
 
 export type Device = {
-  id: string
-  name: string
+  device_id: string
+  name?: string
   tailscaleIp?: string
   status?: 'online'|'offline'
-  battery?: number
-  tempC?: number
-  latencyMs?: number
+  battery_level_num?: number | null
+  battery_temp_num?: number | null
+  is_charging?: boolean | null
+  timestamp?: string
 }
 
 export type Alert = {
-  _id?: string
   device_id: string
   level: 'warning'|'critical'
   message: string
@@ -25,7 +24,17 @@ export async function fetchDevices(): Promise<Device[]> {
   return data
 }
 
-export async function fetchAlerts(): Promise<Alert[]> {
-  const { data } = await axios.get(`${API_BASE}/api/alerts?limit=50`)
+export async function fetchAlerts(limit = 50): Promise<Alert[]> {
+  const { data } = await axios.get(`${API_BASE}/api/alerts?limit=${limit}`)
+  return data
+}
+
+export async function fetchDiscovered(): Promise<Device[]> {
+  const { data } = await axios.get(`${API_BASE}/api/devices/discovered`)
+  return data
+}
+
+export async function bulkAddDevices(payload: {device_id: string; name: string; location?: string; tailscaleIp?: string}[]) {
+  const { data } = await axios.post(`${API_BASE}/api/devices/bulk_add`, payload)
   return data
 }
