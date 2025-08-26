@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --panel-bg: #0f1115;
+  --panel-border: #1f2430;
+}
+body { @apply bg-[#0b0d12] text-gray-200; }
