@@ -15,13 +15,25 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import PyMongoError
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
+from bson import ObjectId
+try:
+    # When running as a package (recommended)
+    from . import local_store as offline
+except Exception:
+    # When running as a standalone module (fallback)
+    import local_store as offline  # type: ignore
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV & CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
-load_dotenv()
+# Load .env from current working dir and also from this module's directory
+_ENV_NEARBY = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv()  # CWD or parent
+if os.path.exists(_ENV_NEARBY):
+    load_dotenv(_ENV_NEARBY)
 
 MONGO_URI  = os.getenv("MongoDB_URI", "mongodb://localhost:27017")
 MONGO_DB   = os.getenv("MongoDB_DB",  "monitoring_system")
+OFFLINE_ONLY = os.getenv("OFFLINE_ONLY", "false").strip().lower() in {"1", "true", "yes"}
 
 # CORS
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*")
@@ -55,6 +67,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Helper to persist /api/devices output locally for debugging/exports
+def _save_devices_json(items: List[Dict[str, Any]]):
+    try:
+        default_path = os.path.join(os.path.dirname(__file__), "devices_snapshot.json")
+        export_path = os.getenv("DEVICES_EXPORT_PATH", default_path)
+        dir_name = os.path.dirname(export_path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        with open(export_path, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2, default=str)
+        print(f"[INFO] /api/devices snapshot written to: {os.path.abspath(export_path)}")
+    except Exception as e:
+        # Non-fatal: just log
+        print(f"[WARN] Failed to write devices JSON: {e}")
+
+# Offline queue directory (for fallback when Mongo is unavailable)
+OFFLINE_QUEUE_DIR = "C:/Users/Lemon/iCloudDrive/Documents/AboutMe/Work/MyJob/vscode/ptz_software/src/omnivision/mach-dashboard-backend/offline_queue"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # MONGO
 # ──────────────────────────────────────────────────────────────────────────────
@@ -75,6 +105,7 @@ try:
     col_devices  = db["devices"]           # discovery cache (tailscale)
     col_snap     = db["device_snapshots"]  # append-only snapshots of device_doc
     col_latest   = db["device_latest"]     # last-known device_doc
+    col_commands = db["commands"]          # queued control commands for agent
 
     col_status.create_index([("device_id", ASCENDING), ("timestamp", DESCENDING)])
     col_power.create_index([("device_id", ASCENDING), ("ts", DESCENDING)])
@@ -82,9 +113,11 @@ try:
     col_devices.create_index([("tailscaleIp", ASCENDING)], unique=True)
     col_snap.create_index([("device_id", ASCENDING), ("timestamp", DESCENDING)])
     col_latest.create_index([("device_id", ASCENDING)], unique=True)
+    col_commands.create_index([("status", ASCENDING), ("created_at", DESCENDING)])
 except Exception as e:
     print(f"[WARN] Mongo init issue: {e}")
     db = col_status = col_power = col_alerts = col_devices = col_snap = col_latest = None
+    col_commands = None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MODELS
@@ -204,7 +237,7 @@ def healthz():
         return {"ok": False, "mongo": False, "error": str(e)}
 
 @app.get("/api/devices")
-def api_devices():
+def api_devices(download: bool = Query(False, description="If true, force JSON download")):
     """Return devices directly from Tailscale Admin API when configured.
     Falls back to existing Mongo-backed view if TS creds are missing or call fails.
     """
@@ -289,6 +322,11 @@ def api_devices():
                         it["is_charging"] = doc.get("is_charging")
 
             items.sort(key=lambda x: (x.get("device_id") or x.get("name") or ""))
+            _save_devices_json(items)
+            if download:
+                return JSONResponse(content=items, headers={
+                    "Content-Disposition": "attachment; filename=devices.json"
+                })
             return items
         except Exception as e:
             # Fall back to previous behavior if TS call fails
@@ -296,7 +334,15 @@ def api_devices():
 
     # Fallback: previous Mongo-backed behavior
     now = _now()
-    items = list(col_latest.find({}, {"_id": 0})) if col_latest is not None else []
+    # Pull latest device snapshots, newest first
+    if col_latest is not None:
+        try:
+            items = list(col_latest.find({}, {"_id": 0}).sort("timestamp", DESCENDING))
+        except Exception:
+            # Fallback to unsorted if sort not available
+            items = list(col_latest.find({}, {"_id": 0}))
+    else:
+        items = []
     disc_map: Dict[str, Dict[str, Any]] = {}
     try:
         for d in db.devices.find({}, {"_id": 0, "name": 1, "device_id": 1, "tailscaleIp": 1, "connected": 1, "lastSeen": 1, "os": 1}):
@@ -348,7 +394,15 @@ def api_devices():
             elif isinstance(nm, str):
                 d["displayName"] = nm
         d["status"] = "online" if d.get("connected") else "offline"
-    items.sort(key=lambda x: (x.get("device_id") or x.get("name") or ""))
+    # Order by most recent update first (using ISO string is fine as it's tz-aware)
+    def _sort_key(d: Dict[str, Any]):
+        return d.get("updatedAt") or d.get("timestamp") or ""
+    items.sort(key=_sort_key, reverse=True)
+    _save_devices_json(items)
+    if download:
+        return JSONResponse(content=items, headers={
+            "Content-Disposition": "attachment; filename=devices.json"
+        })
     return items
 
 @app.get("/api/alerts")
@@ -379,32 +433,24 @@ def api_alerts(device_id: str, limit: int = 50):
     q = {"device_id": device_id}
     return list(col_alerts.find(q, {"_id": 0}).sort("timestamp", DESCENDING).limit(int(limit)))
 
-@app.get("/api/alerts/all")
-def api_alerts_all(limit: int = 200, level: Optional[str] = None, device_id: Optional[str] = None):
-    if col_alerts is None:
-        return []
-    q: Dict[str, Any] = {}
-    if level:
-        q["level"] = level
-    if device_id:
-        q["device_id"] = device_id
-    try:
-        cursor = col_alerts.find(q, {"_id": 0}).sort("timestamp", DESCENDING).limit(int(limit))
-        return list(cursor)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch alerts: {e}")
-
 @app.post("/api/alerts")
 def api_alerts_post(payload: AlertIn):
-    if col_alerts is None:
-        raise HTTPException(status_code=500, detail="alerts collection missing")
     doc = {
         "device_id": payload.device_id,
         "level": payload.level,
         "message": payload.message,
         "timestamp": payload.timestamp or _now(),
     }
-    col_alerts.insert_one(doc)
+    try:
+        if OFFLINE_ONLY:
+            raise RuntimeError("offline-only")
+        if col_alerts is not None:
+            col_alerts.insert_one(doc)
+        else:
+            raise RuntimeError("col_alerts unavailable")
+    except Exception:
+        # Fallback to offline queue
+        offline.enqueue("alerts", doc, OFFLINE_QUEUE_DIR)
     return {"ok": True}
 
 
@@ -427,9 +473,16 @@ def ingest_status(payload: PhoneStatusIn):
             "raw": payload.raw,
         }
 
-        # Insert time-series sample
-        if col_status is not None:
-            col_status.insert_one(doc_status)
+        # Insert time-series sample (fallback to offline queue if needed)
+        try:
+            if OFFLINE_ONLY:
+                raise RuntimeError("offline-only")
+            if col_status is not None:
+                col_status.insert_one(doc_status)
+            else:
+                raise RuntimeError("col_status unavailable")
+        except Exception:
+            offline.enqueue("phone_status", doc_status, OFFLINE_QUEUE_DIR)
 
         # Maintain latest snapshot for /api/devices
         device_latest = {
@@ -440,12 +493,19 @@ def ingest_status(payload: PhoneStatusIn):
             "is_charging": payload.is_charging,
             "network_type": payload.network_type or "tailscale",
         }
-        if col_latest is not None:
-            col_latest.update_one(
-                {"device_id": payload.device_id},
-                {"$set": device_latest},
-                upsert=True,
-            )
+        try:
+            if OFFLINE_ONLY:
+                raise RuntimeError("offline-only")
+            if col_latest is not None:
+                col_latest.update_one(
+                    {"device_id": payload.device_id},
+                    {"$set": device_latest},
+                    upsert=True,
+                )
+            else:
+                raise RuntimeError("col_latest unavailable")
+        except Exception:
+            offline.enqueue("device_latest", device_latest, OFFLINE_QUEUE_DIR)
 
         # Optional legacy snapshot for /logs endpoints and backward-compat keys
         legacy_snapshot = {
@@ -456,12 +516,173 @@ def ingest_status(payload: PhoneStatusIn):
             "battery temperature": payload.battery_temperature,
             "battery charging": payload.is_charging,
         }
-        if col_snap is not None:
-            col_snap.insert_one(legacy_snapshot)
+        try:
+            if OFFLINE_ONLY:
+                raise RuntimeError("offline-only")
+            if col_snap is not None:
+                col_snap.insert_one(legacy_snapshot)
+            else:
+                raise RuntimeError("col_snap unavailable")
+        except Exception:
+            offline.enqueue("device_snapshots", legacy_snapshot, OFFLINE_QUEUE_DIR)
 
         return {"ok": True}
     except PyMongoError as e:
         return {"ok": False, "error": str(e)}
+
+# Camera control: queue commands for agent to execute on device phone-server
+@app.post("/api/devices/{device_id}/camera/start")
+def camera_start(device_id: str):
+    doc = {
+        "device_id": device_id,
+        "type": "camera",
+        "action": "start",
+        "status": "pending",
+        "created_at": _now(),
+        "last_error": None,
+        "attempts": 0,
+    }
+    try:
+        if OFFLINE_ONLY:
+            raise RuntimeError("offline-only")
+        if col_commands is not None:
+            res = col_commands.insert_one(doc)
+            return {"ok": True, "id": str(res.inserted_id)}
+        else:
+            raise RuntimeError("col_commands unavailable")
+    except Exception:
+        # Fallback to offline queue (agent does not read this yet, but preserves intent)
+        path = offline.enqueue("commands", doc, OFFLINE_QUEUE_DIR)
+        return {"ok": True, "offline_path": path}
+
+
+@app.post("/api/devices/{device_id}/camera/stop")
+def camera_stop(device_id: str):
+    doc = {
+        "device_id": device_id,
+        "type": "camera",
+        "action": "stop",
+        "status": "pending",
+        "created_at": _now(),
+        "last_error": None,
+        "attempts": 0,
+    }
+    try:
+        if OFFLINE_ONLY:
+            raise RuntimeError("offline-only")
+        if col_commands is not None:
+            res = col_commands.insert_one(doc)
+            return {"ok": True, "id": str(res.inserted_id)}
+        else:
+            raise RuntimeError("col_commands unavailable")
+    except Exception:
+        path = offline.enqueue("commands", doc, OFFLINE_QUEUE_DIR)
+        return {"ok": True, "offline_path": path}
+
+
+# Agent polling endpoints
+@app.get("/api/commands/pending")
+def commands_pending(limit: int = 20):
+    if col_commands is None:
+        return []
+    try:
+        cur = col_commands.find({"status": "pending"}).sort("created_at", ASCENDING).limit(int(limit))
+        rows = list(cur)
+        # normalize _id to string for frontend/agent
+        out = []
+        for r in rows:
+            r2 = dict(r)
+            try:
+                r2["id"] = str(r2.pop("_id"))
+            except Exception:
+                pass
+            out.append(json.loads(dumps(r2)))
+        return out
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list commands: {e}")
+
+
+class CommandCompleteIn(BaseModel):
+    status: str  # "success" | "failed"
+    message: Optional[str] = None
+
+
+@app.post("/api/commands/{cmd_id}/complete")
+def command_complete(cmd_id: str, body: CommandCompleteIn):
+    if col_commands is None:
+        raise HTTPException(status_code=500, detail="commands collection unavailable")
+    try:
+        oid = ObjectId(cmd_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid command id")
+    try:
+        res = col_commands.update_one(
+            {"_id": oid},
+            {"$set": {"status": body.status, "completed_at": _now(), "last_error": body.message}},
+        )
+        if res.matched_count == 0:
+            raise HTTPException(status_code=404, detail="command not found")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update command: {e}")
+
+
+@app.get("/api/devices/{device_id}/webcam/reachable")
+async def webcam_reachable(device_id: str, timeout_seconds: int = 8):
+    """Ask the agent to probe IP Webcam (`/sensors.html`) reachability for a device.
+    Returns a quick boolean based on command completion.
+    """
+    if OFFLINE_ONLY or col_commands is None:
+        raise HTTPException(status_code=503, detail="command queue unavailable")
+
+    # Enqueue a probe command
+    doc = {
+        "device_id": device_id,
+        "type": "probe",
+        "action": "webcam",
+        "status": "pending",
+        "created_at": _now(),
+        "last_error": None,
+        "attempts": 0,
+    }
+    try:
+        res = col_commands.insert_one(doc)
+        cmd_id = res.inserted_id
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to enqueue probe: {e}")
+
+    # Poll for completion up to timeout_seconds
+    waited = 0.0
+    interval = 0.5
+    status = "pending"
+    message: Optional[str] = None
+    created_at = _now()
+    while waited < max(1, timeout_seconds):
+        try:
+            row = col_commands.find_one({"_id": cmd_id}, {"status": 1, "last_error": 1, "created_at": 1, "completed_at": 1})
+            if row:
+                status = row.get("status", status)
+                message = row.get("last_error")
+                created_at = row.get("created_at") or created_at
+                if status in ("success", "failed"):
+                    break
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+        waited += interval
+
+    reachable = True if status == "success" else False if status == "failed" else None
+    # Compose response; include basic timing info
+    now = _now()
+    took_ms = None
+    try:
+        if isinstance(created_at, datetime):
+            took_ms = int((now - created_at).total_seconds() * 1000)
+    except Exception:
+        took_ms = None
+    return {"device_id": device_id, "reachable": reachable, "status": status, "message": message, "tookMs": took_ms}
 
 # Add at global level
 # Track per-device tracking status and server start time
@@ -472,13 +693,75 @@ async def start_tracking(device_id: str):
     started_at = _now()
     key = (device_id or "").lower()
     tracking_state[key] = {"is_tracking": True, "started_at": started_at}
+
+    # Persist tracking flag so agent/collector (and multi-instance backends) can see it
+    try:
+        if OFFLINE_ONLY:
+            raise RuntimeError("offline-only")
+        if col_devices is not None:
+            col_devices.update_one(
+                {"device_id": device_id},
+                {"$set": {"tracking": True, "updatedAt": started_at}},
+                upsert=True,
+            )
+    except Exception:
+        # Best-effort only; in offline-only mode the in-memory state will still control
+        pass
+
     return {"status": "started", "device_id": device_id, "started_at": started_at}
 
 @app.post("/api/devices/{device_id}/tracking/stop")
 async def stop_tracking(device_id: str):
     key = (device_id or "").lower()
     tracking_state[key] = {"is_tracking": False, "started_at": None}
+
+    # Persist tracking flag to false
+    try:
+        if OFFLINE_ONLY:
+            raise RuntimeError("offline-only")
+        if col_devices is not None:
+            col_devices.update_one(
+                {"device_id": device_id},
+                {"$set": {"tracking": False, "updatedAt": _now()}},
+                upsert=True,
+            )
+    except Exception:
+        pass
+
     return {"status": "stopped", "device_id": device_id}
+
+@app.get("/api/tracking")
+def get_tracking():
+    try:
+        out_list: List[Dict[str, Any]] = []
+        tracked: Dict[str, Dict[str, Any]] = {}
+
+        # In-memory state
+        for devid, st in tracking_state.items():
+            if isinstance(st, dict) and st.get("is_tracking"):
+                started_at = st.get("started_at")
+                if isinstance(started_at, datetime):
+                    started_at = started_at.isoformat()
+                tracked[devid] = {"device_id": devid, "started_at": started_at}
+
+        # Persisted state (Mongo) as fallback/merge
+        try:
+            if col_devices is not None:
+                cur = col_devices.find({"tracking": True}, {"_id": 0, "device_id": 1})
+                for row in cur or []:
+                    devid = str(row.get("device_id") or "").lower()
+                    if not devid:
+                        continue
+                    tracked.setdefault(devid, {"device_id": devid, "started_at": None})
+        except Exception:
+            # Ignore DB errors; return in-memory state
+            pass
+
+        tracked_ids = sorted(list(tracked.keys()))
+        out_list = list(tracked.values())
+        return {"tracked": tracked_ids, "devices": out_list}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read tracking state: {e}")
 
 @app.get("/api/devices/{device_id}/logs")
 def get_device_logs(device_id: str, since: Optional[str] = None):
@@ -610,4 +893,43 @@ def api_metrics(
 @app.on_event("startup")
 async def _startup():
     print("[startup] Mach Local Monitor")
+
+
+# Offline helper endpoints for UI
+@app.get("/api/offline/status")
+def offline_status():
+    base = OFFLINE_QUEUE_DIR
+    per: Dict[str, int] = {}
+    total = 0
+    try:
+        if os.path.isdir(base):
+            for name in os.listdir(base):
+                if name == "failed":
+                    continue
+                cdir = os.path.join(base, name)
+                if not os.path.isdir(cdir):
+                    continue
+                cnt = sum(1 for fn in os.listdir(cdir) if fn.endswith(".json"))
+                if cnt:
+                    per[name] = cnt
+                    total += cnt
+    except Exception:
+        pass
+    return {"pending_total": total, "per_collection": per}
+
+
+class OfflineTestIn(BaseModel):
+    message: Optional[str] = None
+
+
+@app.post("/api/offline/test")
+def offline_test(body: OfflineTestIn):
+    doc = {
+        "source": "ui",
+        "timestamp": _now(),
+        "message": body.message or "manual test",
+    }
+    path = offline.enqueue("debug_events", doc, OFFLINE_QUEUE_DIR)
+    st = offline_status()
+    return {"ok": True, "path": path, "status": st}
 
