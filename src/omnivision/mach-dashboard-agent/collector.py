@@ -3,7 +3,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -123,17 +123,20 @@ def _to_float(v: Any) -> Optional[float]:
         return None
 
 
-async def poll_one(client: httpx.AsyncClient, target: Target) -> Optional[Dict[str, Any]]:
+async def poll_one(client: httpx.AsyncClient, target: Target) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     # Try a few common endpoints/ports for different device apps
     ports = [target.port]
     if WEBCAM_PORT not in ports:
         ports.append(WEBCAM_PORT)
+    if PHONE_SVR_PORT not in ports:
+        ports.append(PHONE_SVR_PORT)
     paths = [
         "/sensors.json?sense=battery_charging,battery_level,battery_temp",
         "/sensors.json",
         "/sensor.json",
     ]
     last_err: Optional[Exception] = None
+    last_err_msg: Optional[str] = None
     for port in ports:
         for path in paths:
             url = f"http://{target.ip}:{port}{path}"
@@ -141,17 +144,20 @@ async def poll_one(client: httpx.AsyncClient, target: Target) -> Optional[Dict[s
                 r = await client.get(url, timeout=5)
                 r.raise_for_status()
                 data = r.json()
+                last_err_msg = None
                 # success
                 break
             except Exception as e:
                 last_err = e
+                last_err_msg = str(e)
                 data = None
                 continue
         if data is not None:
             break
     if data is None:
-        print(f"[poll] {target.device_id}@{target.ip} failed: {last_err}")
-        return None
+        err_text = last_err_msg or (str(last_err) if last_err else None)
+        print(f"[poll] {target.device_id}@{target.ip} failed: {err_text}")
+        return None, err_text
 
     # Support two shapes:
     # 1) Flat: {"battery_level": 99, "battery_temp": 43.7, "battery_charging": true}
@@ -189,6 +195,17 @@ async def poll_one(client: httpx.AsyncClient, target: Target) -> Optional[Dict[s
       cv = last_from_series(data.get("battery_charging", {}))
       # some sources use 0/1/10; treat >0 as True
       charging = _to_bool(bool(cv and float(cv) > 0))
+
+    payload: Dict[str, Any] = {
+        "device_id": target.device_id,
+        "timestamp": _now().isoformat(),
+        "battery_percentage": level,
+        "battery_temperature": temp,
+        "is_charging": charging,
+        "network_type": "tailscale",
+        "raw": data,
+    }
+    return payload, None
 
 async def post_status(client: httpx.AsyncClient, payload: Dict[str, Any]) -> None:
     url = f"{BACKEND_BASE}/api/status"
@@ -249,37 +266,42 @@ async def run_once() -> None:
 
         async def worker(t: Target):
             async with sem:
-                payload = await poll_one(client, t)
+                payload, err = await poll_one(client, t)
                 if payload is None:
-                    await post_alert(client, t.device_id, "warning", "IP Webcam sensors fetch failed")
-                if payload:
-                    await post_status(client, payload)
-                    # simple alert rules
-                    devid = payload["device_id"]
-                    level = payload.get("battery_percentage")
-                    temp = payload.get("battery_temperature")
-                    charging = payload.get("is_charging")
+                    message = "IP Webcam sensors fetch failed"
+                    if err:
+                        message = f"{message}: {err}"
+                    await post_alert(client, t.device_id, "warning", message)
+                    return
 
-                    if isinstance(level, (int, float)):
-                        if level <= CRIT_BATT_PCT:
-                            await post_alert(client, devid, "critical", f"Battery critically low ({level}%)")
-                        elif level <= WARN_BATT_PCT:
-                            await post_alert(client, devid, "warning", f"Battery low ({level}%)")
+                await post_status(client, payload)
+                # simple alert rules
+                devid = payload["device_id"]
+                level = payload.get("battery_percentage")
+                temp = payload.get("battery_temperature")
+                charging = payload.get("is_charging")
 
-                    if isinstance(temp, (int, float)):
-                        if temp >= CRIT_BATT_TEMP_C:
-                            await post_alert(client, devid, "critical", f"Battery temperature high ({temp}Â°C)")
-                        elif temp >= WARN_BATT_TEMP_C:
-                            await post_alert(client, devid, "warning", f"Battery temperature elevated ({temp}Â°C)")
+                if isinstance(level, (int, float)):
+                    if level <= CRIT_BATT_PCT:
+                        await post_alert(client, devid, "critical", f"Battery critically low ({level}%)")
+                    elif level <= WARN_BATT_PCT:
+                        await post_alert(client, devid, "warning", f"Battery low ({level}%)")
 
-                    prev = last_state.get(devid)
-                    if prev is None:
+                if isinstance(temp, (int, float)):
+                    if temp >= CRIT_BATT_TEMP_C:
+                        await post_alert(client, devid, "critical", f"Battery temperature high ({temp}C)")
+                    elif temp >= WARN_BATT_TEMP_C:
+                        await post_alert(client, devid, "warning", f"Battery temperature elevated ({temp}C)")
+
+                prev = last_state.get(devid)
+                if prev is None:
+                    last_state[devid] = {"is_charging": charging}
+                else:
+                    if prev.get("is_charging") != charging and charging is not None:
+                        state = "charging" if charging else "not charging"
+                        await post_alert(client, devid, "warning", f"Charging state changed: {state}")
                         last_state[devid] = {"is_charging": charging}
-                    else:
-                        if prev.get("is_charging") != charging and charging is not None:
-                            state = "charging" if charging else "not charging"
-                            await post_alert(client, devid, "warning", f"Charging state changed: {state}")
-                            last_state[devid] = {"is_charging": charging}
+
 
         if targets:
             await asyncio.gather(*(worker(t) for t in targets))
