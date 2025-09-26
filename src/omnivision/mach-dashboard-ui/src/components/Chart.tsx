@@ -1,86 +1,153 @@
-// src/components/MetricChart.tsx
-import { useEffect, useState } from "react";
-import axios from "axios";
-import {
-  LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, ResponsiveContainer,
-} from "recharts";
+import { memo, useEffect, useRef, useState } from "react";
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
+const API_BASE = 'https://mach-dashboard-backend-290982618858.us-central1.run.app';
+// const API_BASE = 'http://localhost:8000'; // for local dev
 
-type Point = { t: string; avg: number };
+type Metric = 'battery' | 'temperature';
 
-export default function MetricChart({
-  deviceId,
-  field,
-  range = "1h",
-  interval = "1m",
-  unit,
-  title,
-}: {
+type MetricChartProps = {
   deviceId: string;
-  field: string;
-  range?: string;
-  interval?: string;
   unit?: string;
   title?: string;
-}) {
-  const [data, setData] = useState<Point[]>([]);
+  mode?: "history" | "live"; // history = /logs/all, live = poll /logs since startAt
+  startAt?: number; // epoch ms; only used in live mode to filter points since Start was clicked
+  from?: number; // epoch ms; optional lower bound (history mode)
+  to?: number;   // epoch ms; optional upper bound (history mode)
+  pollMs?: number; // live polling interval
+  metric?: Metric; // which value to plot
+};
+
+type DataPoint = {
+  x: Date;
+  y: number;
+};
+
+function MetricChart({
+  deviceId,
+  unit = "",
+  title = "Battery %",
+  mode = "history",
+  startAt,
+  from,
+  to,
+  pollMs = 3000,
+  metric = 'battery',
+}: MetricChartProps) {
+  const [data, setData] = useState<DataPoint[]>([]);
   const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
+  const pollRef = useRef<number | null>(null);
 
+  // HISTORY: one-shot fetch of all logs
   useEffect(() => {
-    let alive = true;
-
-    const load = async () => {
+    if (mode !== "history") return;
+    let cancelled = false;
+    const fetchLogs = async () => {
+      setLoading(true);
       try {
-        const res = await axios.get(`${API_BASE}/api/metrics`, {
-          params: { device_id: deviceId, field, range, interval },
-        });
-        if (!alive) return;
-        const pts = (res.data?.points || []).map((p: any) => ({
-          t: new Date(p.t).toLocaleTimeString(),
-          avg: Number(p.avg),
-        }));
-        setData(pts);
-        setErr(null);
-      } catch (e: any) {
-        if (!alive) return;
-        setErr(e?.message || "Failed to load");
+        const res = await fetch(`${API_BASE}/api/devices/${deviceId}/logs/all`);
+        const raw = await res.json();
+        if (cancelled) return;
+        const parsed = raw
+          .map((log: any) => {
+            const timestamp = log.timestamp?.$date;
+            const val = metric === 'battery'
+              ? (log.battery_level_num ?? (log["battery level"] != null ? Number(log["battery level"]) : undefined))
+              : (log.battery_temp_num ?? (log["battery temperature"] != null ? Number(log["battery temperature"]) : undefined));
+            if (!timestamp || val === undefined) return null;
+            return { x: new Date(timestamp), y: Number(val) };
+          })
+          .filter((point: DataPoint | null): point is DataPoint => !!point)
+          .filter((p: DataPoint) => (from ? p.x.getTime() >= from : true))
+          .filter((p: DataPoint) => (to ? p.x.getTime() <= to : true));
+        setData(parsed);
+      } catch (err) {
+        console.error("Failed to load device logs:", err);
       } finally {
-        if (alive) setLoading(false);
+        if (!cancelled) setLoading(false);
+      }
+    };
+    fetchLogs();
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceId, mode, from, to, metric]);
+
+  // LIVE: poll recent logs and accumulate since startAt
+  useEffect(() => {
+    if (mode !== "live") return;
+    // reset data when device or startAt changes
+    setData([]);
+    setLoading(true);
+
+    const doPoll = async () => {
+      try {
+        const qs = startAt ? `?since=${encodeURIComponent(String(startAt))}` : "";
+        const res = await fetch(`${API_BASE}/api/devices/${deviceId}/logs${qs}`);
+        const raw = await res.json();
+        const parsed: DataPoint[] = raw
+          .map((log: any) => {
+            const timestamp = log.timestamp?.$date;
+            // backend attaches numeric *_num; fall back to string fields
+            const val = metric === 'battery'
+              ? (log.battery_level_num ?? (log["battery level"] != null ? Number(log["battery level"]) : undefined))
+              : (log.battery_temp_num ?? (log["battery temperature"] != null ? Number(log["battery temperature"]) : undefined));
+            if (!timestamp || val === undefined) return null;
+            return { x: new Date(timestamp), y: Number(val) };
+          })
+          .filter((p: DataPoint | null): p is DataPoint => !!p)
+          .filter((p: DataPoint) => (startAt ? p.x.getTime() >= startAt : true));
+
+        // Keep unique by timestamp, sorted
+        const byTs = new Map<number, DataPoint>();
+        [...data, ...parsed].forEach((p: DataPoint) => byTs.set(p.x.getTime(), p));
+        const merged = Array.from(byTs.values()).sort((a: DataPoint, b: DataPoint) => a.x.getTime() - b.x.getTime());
+        setData(merged);
+      } catch (e) {
+        console.error("Live poll failed", e);
+      } finally {
+        setLoading(false);
       }
     };
 
-    load();
-    const id = setInterval(load, 5000); // poll every 5s
-    return () => { alive = false; clearInterval(id); };
-  }, [deviceId, field, range, interval]);
+    // immediate poll, then interval
+    doPoll();
+    pollRef.current = window.setInterval(doPoll, pollMs);
+    return () => {
+      if (pollRef.current) window.clearInterval(pollRef.current);
+    };
+  }, [deviceId, mode, startAt, pollMs]);
 
   return (
-    <div className="rounded-xl border p-3 m-2" style={{borderColor: "var(--panel-border)", background: "var(--panel-bg)"}}>
-      <div className="text-sm mb-2">
-        {title || field} {unit ? <span className="text-gray-400">({unit})</span> : null}
-      </div>
+    <div className="p-2 border rounded bg-slate-800 text-white" style={{ height: "200px" }}>
+      <div className="text-xs mb-1 font-semibold">{title}</div>
 
-      <div className="h-60 w-full">
-        {loading ? (
-          <div className="h-full flex items-center justify-center text-xs text-gray-500">Loading…</div>
-        ) : err ? (
-          <div className="h-full flex items-center justify-center text-xs text-red-400">{err}</div>
-        ) : data.length === 0 ? (
-          <div className="h-full flex items-center justify-center text-xs text-gray-500">No data</div>
-        ) : (
-          <ResponsiveContainer>
-            <LineChart data={data}>
-              <CartesianGrid strokeDasharray="3 3" />
-              <XAxis dataKey="t" minTickGap={20} />
-              <YAxis />
-              <Tooltip />
-              <Line type="monotone" dataKey="avg" dot={false} />
-            </LineChart>
-          </ResponsiveContainer>
-        )}
-      </div>
+      {loading ? (
+        <div className="text-xxs text-gray-400">Loading...</div>
+      ) : data.length === 0 ? (
+        <div className="text-xxs text-gray-400">No data available</div>
+      ) : (
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={data}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#444" />
+            <XAxis
+              dataKey="x"
+              tickFormatter={(tick) => new Date(tick).toLocaleTimeString()}
+              stroke="#ccc"
+              fontSize={10}
+            />
+            <YAxis unit={unit} stroke="#ccc" fontSize={10} />
+            <Tooltip
+              labelFormatter={(label) => new Date(label).toLocaleString()}
+              formatter={(value: number) => [`${value}${unit}`, title]}
+              contentStyle={{ backgroundColor: "#222", border: "none" }}
+            />
+            <Line type="monotone" dataKey="y" stroke="#66ccff" dot={false} strokeWidth={2} isAnimationActive={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      )}
     </div>
   );
 }
+
+export default memo(MetricChart);

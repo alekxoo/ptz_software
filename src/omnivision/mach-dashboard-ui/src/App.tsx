@@ -1,132 +1,199 @@
-import { useEffect, useRef, useState } from 'react'
-import { fetchDevices, fetchAlerts, type Device /*, bulkAddDevices*/ } from './lib/api'
+import { useEffect, useMemo, useState } from 'react'
+import { fetchDevices, fetchDiscovered as fetchDiscoveredApi, type Device, getOfflineStatus, testOfflineWrite } from './lib/api'
 import { useAppStore } from './store/useAppStore'
 import DeviceCard from './components/DeviceCard'
-import AlertsPanel from './components/AlertsPanel'
-import AddFromDiscovery from './components/AddDevice'
-import MetricChart from './components/Chart'
+import AddDevice from './components/AddDevice'
+// import Tabs from './components/Tab'
 import './App.css'
 
-
-const API_BASE = import.meta.env.API_BASE || 'http://localhost:8000'
-const did = (d: Device) => (d.device_id || '').toLowerCase()
+// const API_BASE = 'https://mach-dashboard-backend-290982618858.us-central1.run.app';
+// const API_BASE = ['http://localhost:8000']; // for local dev with proxy
+const STORAGE_KEY = 'activeDeviceIds';
+const keyOf = (d: any) =>
+  String(d?.device_id || d?.id || d?.tailscaleIp || '').trim().toLowerCase();
+const norm = (s: string) => String(s || '').trim().toLowerCase();
 
 export default function App() {
-  const { devices, alerts, setDevices, setAlerts } = useAppStore()
-  const [localAdded, setLocalAdded] = useState<Device[]>([]) // ← sticky client set
-  const firstDeviceId = 'h2r-pixel-1.tail9e9110.ts.net'
-  // Merge helper: union by device_id, prefer polled data over local stubs
-  const mergeDevices = (polled: Device[], locals: Device[]) => {
-    const map = new Map<string, Device>()
-    for (const d of locals) map.set(did(d), d)
-    for (const d of polled) map.set(did(d), d) // polled wins
-    // filter out empties
-    return Array.from(map.values()).filter(d => d.device_id)
-  }
+  const { devices, alerts, setDevices } = useAppStore()
+  const [selectedIds, setSelectedIds] = useState<string[]>([]) // controls what shows on the dashboard
+  const [trackingDeviceId, setTrackingDeviceId] = useState<string[]>([]);
+  const [offlinePending, setOfflinePending] = useState<number>(0);
+  const [offlineMsg, setOfflineMsg] = useState<string>("");
 
+
+  // Restore selection on load
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY)
+      if (raw) setSelectedIds(JSON.parse(raw))
+      const t = localStorage.getItem('trackedDeviceIds')
+      if (t) setTrackingDeviceId(JSON.parse(t))
+    } catch {}
+  }, [])
+
+  // Persist selection
+  useEffect(() => {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(selectedIds)) } catch {}
+  }, [selectedIds])
+
+  // Persist tracked device IDs so Start/Stop survives reloads
+  useEffect(() => {
+    try { localStorage.setItem('trackedDeviceIds', JSON.stringify(trackingDeviceId)) } catch {}
+  }, [trackingDeviceId])
+
+  // Poll devices & alerts (devices = latest polled status from backend)
   useEffect(() => {
     let mounted = true
     const load = async () => {
       try {
-        const [d, a] = await Promise.all([fetchDevices(), fetchAlerts()])
+        const [d, s] = await Promise.all([fetchDevices(), getOfflineStatus().catch(() => ({ pending_total: 0 }))])
+        
         if (!mounted) return
-        setDevices(mergeDevices(d, localAdded))
-        setAlerts(a)
+        setDevices(d)
+        setOfflinePending((s as any).pending_total ?? 0)
       } catch (e) {
         console.warn('poll error', e)
-        // even on error, keep showing localAdded merged with whatever we had
-        setDevices(mergeDevices(devices, localAdded))
       }
     }
     load()
     const id = setInterval(load, 3000)
     return () => { mounted = false; clearInterval(id) }
-  }, [setDevices, setAlerts, localAdded])
+  }, [setDevices])
 
-  // When the modal returns picks, keep them sticky and (optionally) persist
-  const handlePicked = async (picks: Device[]) => {
-    // 1) Put cards on screen immediately and keep them sticky
-    setLocalAdded(prev => {
-      const seen = new Set(prev.map(did))
-      const merged = [...prev]
-      for (const p of picks) {
-        if (!p.device_id) continue
-        const key = did(p)
-        if (!seen.has(key)) { merged.push(p); seen.add(key) }
-      }
-      return merged
-    })
-    // 2) Reflect in the UI right away
-    setDevices(mergeDevices(devices, picks))
+  // What to display: only selected device IDs
+  const activeDevices = useMemo(() => {
+  const want = new Set(selectedIds.map(norm));
+  return devices
+    .filter(d => want.has(keyOf(d)))
+    .map(d => ({ ...d, tracking: d.tracking ?? false })); //
+}, [devices, selectedIds]);
 
-    // 3) Persist to backend in background (uncomment if endpoint exists)
-    // try { await bulkAddDevices(picks) } catch (e) { console.warn('bulkAdd failed', e) }
-  }
 
-  // Discovery fetcher for the modal
-  const fetchDiscovered = async () => {
-    const res = await fetch(`${API_BASE}/api/devices/discovered`)
-    if (!res.ok) throw new Error(`discovered ${res.status}`)
-    return await res.json()
-  }
+  // Add picks from the modal (expects an array of Device objects)
+  const handlePicked = (picks: Device[]) => {
+  const addKeys = picks
+    .map(keyOf)
+    .filter(Boolean)
+    .filter(k => !selectedIds.includes(k));
+  if (addKeys.length) setSelectedIds(prev => [...prev, ...addKeys]);
+};
+
+
+  // Remove handler passed to each card
+  const handleRemove = (id: string) => {
+  const k = norm(id);
+  setSelectedIds(prev => prev.filter(x => x !== k));
+};
+
+
+// Discovery fetcher for the modal (use centralized API client)
+const fetchDiscovered = async () => {
+  return await fetchDiscoveredApi()
+}
+
 
   return (
-    <div className="h-screen grid grid-cols-12 grid-rows-12 p-3">
+    <div className="h-screen grid grid-cols-16 grid-rows-12 p-3">
       {/* Devices + Add */}
       <div className="col-span-8 row-span-12 space-y-3">
         <div className="flex items-center justify-between">
-          <div className="text-sm font-semibold">Devices</div>
-          <AddFromDiscovery
-            existing={devices}
+          <AddDevice
+            // 'existing' is optional; pass currently selected so modal can avoid duplicates if it wants
+            existing={activeDevices}
             onPicked={handlePicked}
             fetchDiscovered={fetchDiscovered}
           />
+          <div className="flex items-center gap-2">
+            <button
+              className="text-xs px-2 py-1 bg-blue-600 text-white rounded"
+              onClick={async () => {
+                setOfflineMsg('')
+                try {
+                  const res = await testOfflineWrite('clicked from UI')
+                  setOfflinePending(res.status?.pending_total ?? offlinePending)
+                  setOfflineMsg(res.ok ? 'Saved locally ✓' : 'Save failed')
+                } catch (e) {
+                  setOfflineMsg('Save failed')
+                }
+              }}
+            >
+              Test Local Save
+            </button>
+            <div className="text-xxs text-gray-600">
+              Offline queue: {offlinePending}
+              {offlineMsg && <span className="ml-2 text-gray-700">{offlineMsg}</span>}
+            </div>
+          </div>
         </div>
 
         <div className="grid md:grid-cols-2 gap-2">
-          {devices.map(d => (
-            <DeviceCard key={d.device_id || d.name} d={d} />
+          {activeDevices.map(d => (
+              <DeviceCard
+                key={keyOf(d)}
+                d={{
+                  ...d,
+                battery_level_num: d.battery_level_num ?? (d as any)["battery level"],
+                battery_temp_num: d.battery_temp_num ?? (d as any)["battery temperature"],
+                is_charging: d.is_charging ?? (d as any)["battery charging"]
+              }}
+              onRemove={(id) => handleRemove(id)}
+              alerts={alerts.filter(a => a.device_id === d.device_id)}
+              tracking={trackingDeviceId.includes(d.device_id)}
+              onTrackingDeviceId={setTrackingDeviceId}
+            />
+
+
           ))}
-          {devices.length === 0 && (
-            <div className="text-xs text-gray-500">No devices yet</div>
+          {activeDevices.length === 0 && (
+            <div className="text-xs text-gray-500">
+              No devices yet. Click <span className="font-medium">Add Device</span> to select phones to track.
+            </div>
           )}
         </div>
 
-         <div className="text-sm font-semibold mb-2">Monitor</div>
-          <div className="grid md:grid-cols-2 gap-2">
-             <MetricChart
-              title="Battery %"
-              deviceId={firstDeviceId}
-              field="battery_percentage"
-              range="6h"
-              interval="5m"
-              unit="%"
+        {/* <div className="text-xxs text-gray-400 mt-2">
+            <Tabs
+              devices={devices} // full list
+              selectedDeviceIds={selectedIds}
+              setSelectedDeviceIds={setSelectedIds}
+              alerts={alerts}
             />
-            <MetricChart
-              title="Battery Temp"
-              deviceId={firstDeviceId}
-              field="battery_temperature"
-              range="6h"
-              interval="5m"
-              unit="°C"
-            />
-            <MetricChart
-              title="Latency"
-              deviceId={firstDeviceId}
-              field="latency_manual_ms"
-              range="1h"
-              interval="1m"
-              unit="ms"
-            />
-          </div>
-      </div>
-      
+        </div> */}
 
-      {/* Alerts */}
-      <div className="col-span-4 row-span-12 rounded-xl border p-5" style={{ borderColor: 'var(--panel-border)' }}>
-        <div className="text-sm font-semibold mb-2">Alerts</div>
-        <AlertsPanel alerts={alerts} />
+        {/* Monitor (optional: only show when at least one selected) */}
+        {/* {firstSelectedId && (
+          <>
+            <div className="text-sm font-semibold mb-2">Monitor</div>
+            <div className="grid md:grid-cols-2 gap-2">
+              <MetricChart
+                title="Battery %"
+                deviceId={firstSelectedId}
+                field="battery_percentage"
+
+                interval="5m"
+                unit="%"
+              />
+              <MetricChart
+                title="Battery Temp"
+                deviceId={firstSelectedId}
+                field="battery_temperature"
+                range="6h"
+                interval="5m"
+                unit="°C"
+              />
+              <MetricChart
+                title="Latency"
+                deviceId={firstSelectedId}
+                field="latency_manual_ms"
+                range="1h"
+                interval="1m"
+                unit="ms"
+              />
+            </div>
+          </>
+        )} */}
       </div>
+
     </div>
   )
 }

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { Device } from '../lib/api'
+import { computeLastSeenLabel, lastSeenSortKey } from '../lib/lastSeen'
+import type { Device } from '../lib/api'                              
 
 /** The shape your discovery endpoint returns */
 type Row = {
@@ -8,8 +9,10 @@ type Row = {
   name?: string
   tailscaleIp?: string
   addresses?: string[]     // optional list of IPs; we prefer 100.x if present
-  status?: 'online'|'offline'
+  connected?: boolean
   lastSeen?: string
+  os?: string
+  displayName?: string
 }
 
 /** Normalize an ID if present */
@@ -21,7 +24,16 @@ const rowKey = (r: Row, idx: number) => {
   return id || `row-${idx}`        // fallback so checkbox & IP map always work
 }
 
-export default function AddFromDiscovery({
+function maskIp(ip: string): string {
+  const parts = ip.split('.');
+  if (parts.length === 4) {
+    return `${parts[0]}.x.x.${parts[3]}`;
+  }
+  return 'x.x.x.x'; // fallback
+}
+
+
+export default function AddDevice({
   existing,
   onPicked,
   fetchDiscovered,   // () => Promise<Row[]>
@@ -80,6 +92,15 @@ export default function AddFromDiscovery({
     const id = normId(r)
     const name = (r.name || '').toLowerCase()
     return name.includes(term) || id.includes(term) || ip.toLowerCase().includes(term)
+  }).sort((a, b) => {
+    // Connected first
+    const ac = !!a.connected ? 1 : 0
+    const bc = !!b.connected ? 1 : 0
+    if (ac !== bc) return bc - ac
+    // Then by lastSeen recency (desc)
+    const aKey = lastSeenSortKey(a.lastSeen)
+    const bKey = lastSeenSortKey(b.lastSeen)
+    return bKey - aKey
   })
 
   const toggle = (k: string) => setSelected(s => ({ ...s, [k]: !s[k] }))
@@ -142,10 +163,8 @@ export default function AddFromDiscovery({
                 <thead className="text-gray-400">
                   <tr className="text-left">
                     <th className="w-10"></th>
-                    <th>Name</th>
                     <th>Device ID</th>
                     <th style={{ minWidth: 220 }}>IP (choose or edit)</th>
-                    <th>Status</th>
                     <th>Last Seen</th>
                     <th>On Dashboard</th>
                   </tr>
@@ -153,7 +172,6 @@ export default function AddFromDiscovery({
                 <tbody>
                   {filtered.map((r, i) => {
                     const key = rowKey(r, i)
-                    const ip = ipChoice[key] || ''
                     const id = normId(r)
                     const already = existingIds.has(id)
 
@@ -162,25 +180,25 @@ export default function AddFromDiscovery({
                         <td className="py-2">
                           <input
                             type="checkbox"
-                            checked={!!selected[key]}
+                            checked={already ? true : !!selected[key]}
                             onChange={() => toggle(key)}
+                            disabled={already}
+                            title={already ? 'Already on dashboard' : ''}
+                            className={already ? 'opacity-50 cursor-not-allowed' : ''}
                           />
                         </td>
-                        <td className="py-2">{r.name || '—'}</td>
-                        <td className="py-2">{id || '—'}</td>
+                        <td className="py-2">{r.displayName || r.device_id || r.name || '—'}</td>
                         <td className="py-2">
-                          <input
-                            className="w-[220px] rounded px-2 py-1 bg-[#0b0d12] border"
-                            style={{ borderColor: 'var(--panel-border)' }}
-                            placeholder="100.x.x.x"
-                            value={ip}
-                            onChange={(e) => setIpChoice(m => ({ ...m, [key]: e.target.value }))}
-                          />
+                          {ipChoice[key] ? maskIp(ipChoice[key]) : '—'}
                         </td>
-                        <td className={r.status === 'online' ? 'text-green-400' : 'text-red-400'}>
-                          {r.status || '—'}
-                        </td>
-                        <td>{r.lastSeen ? new Date(r.lastSeen).toLocaleString() : '—'}</td>
+                        <td>{(() => {
+                          const { label } = computeLastSeenLabel(r.lastSeen, r.connected)
+                          const isConnected = !!r.connected
+                          const display = isConnected ? 'Connected' : label
+                          return (
+                            <span className={isConnected ? 'text-green-500 font-semibold' : 'text-red-500'}>{display}</span>
+                          )
+                        })()}</td>
                         <td>{already ? 'Yes' : 'No'}</td>
                       </tr>
                     )
