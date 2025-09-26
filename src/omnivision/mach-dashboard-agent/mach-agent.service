@@ -1,0 +1,20 @@
+[Unit]
+Description=Mach Dashboard Tailscale Collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/ptz_software
+Environment=BACKEND_BASE=https://mach-dashboard-backend-290982618858.us-central1.run.app
+Environment=WEBCAM_PORT=8080
+Environment=POLL_INTERVAL=5
+Environment=CONCURRENCY=8
+ExecStart=/usr/bin/env python3 src/omnivision/mach-dashboard-agent/collector.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+
